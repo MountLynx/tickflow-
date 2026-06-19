@@ -1,0 +1,18 @@
+# Counter loop example: seed injects 0, B increments, loops back to A while
+# B's value is < 3. Demonstrates a cycle with a terminating guard.
+#
+# A is OR-join because it has two producers (seed for bootstrap, B for the
+# loop-back) and we want it to fire on either -- not wait for both (seed only
+# fires once). The checker does NOT flag this (no XOR-splitter), so the OR
+# join is declared explicitly with ``A.join: OR``.
+#
+# Run:
+#   python -m flow run examples/counter_loop.txt -b examples/counter_loop_beh.py
+
+[seed]-->A
+seed.body: seed_zero
+A.body: passthru
+A.join: OR
+A-->B
+B.body: incr
+B--|cont_lt3|-->A

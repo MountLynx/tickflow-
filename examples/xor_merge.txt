@@ -1,0 +1,17 @@
+# XOR-merge example: B decides between branch A and D, then Merge combines.
+#
+# Without intervention, Merge is an AND-join over A and D -- but B's guards
+# are mutually exclusive (go_a always True, go_d always False), so Merge
+# would deadlock waiting for the branch that never fires. The checker flags
+# this and the CLI prompts to promote Merge to OR-join.
+#
+# Run:
+#   python -m flow run examples/xor_merge.txt -b examples/xor_merge_beh.py
+
+[start]-->B
+B.body: decide
+B--|go_a|-->A
+B--|go_d|-->D
+A-->Merge
+D-->Merge
+Merge.body: merge
