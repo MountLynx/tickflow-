@@ -105,3 +105,28 @@ def test_separate_nodes_have_separate_state():
     assert rn.marking.node_state["C"]["attempts"] == 1
     # They're distinct dicts.
     assert rn.marking.node_state["B"] is not rn.marking.node_state["C"]
+
+
+def test_node_states_public_api():
+    r = _reg()
+    g = parse("[A]-->B\nB.body: counter\nB--|under_three|-->B\nB.join: OR", registry=r)
+    rn = Runner(g, r)
+    rn.run_until_idle(max_ticks=20, pause_at={3})
+    states = rn.node_states()
+    # Returns a copy with the expected structure.
+    assert "B" in states
+    assert "attempts" in states["B"]
+    # Mutating the returned dict does not affect the marking.
+    states["B"]["attempts"] = 999
+    assert rn.marking.node_state["B"]["attempts"] != 999
+
+
+def test_node_states_empty_when_no_state():
+    r = _reg()
+    g = parse("[A]-->B\nB.body: passthru\nA.body: passthru", registry=r)
+    rn = Runner(g, r)
+    rn.run_until_idle(max_ticks=20)
+    # passthru body doesn't touch state; node_states() has empty dicts at most.
+    states = rn.node_states()
+    for s in states.values():
+        assert s == {}

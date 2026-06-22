@@ -307,6 +307,88 @@ await rn.run_until_idle(max_ticks=100)
 
 Sync and async bodies/guards may be mixed in the same graph.
 
+## Visualization & front-end integration
+
+tickflow exposes everything a front-end needs to render and drive a live
+process graph: static structure, per-tick "what's about to fire", per-node
+state, and a hook timeline.
+
+### Static graph export
+
+```python
+graph.to_dict()      # JSON-able {nodes, edges, starts} for front-end rendering
+graph.to_mermaid()   # mermaid "graph TD" text (READMEs / debuggers)
+```
+
+`to_dict()` includes derived `producers` per node so the front-end doesn't
+recompute adjacency. `to_mermaid()` renders start nodes with stadium shape
+`([name])`, plain edges `A --> B`, guarded edges `A -->|g| B`.
+
+### Fireable preview & node state
+
+```python
+rn.fireable()         # [node names] that would fire on the next tick
+rn.node_states()      # {node: {state dict}} — read-only copy (e.g. attempts)
+```
+
+`fireable()` is computed identically to the engine's internal check, so it
+exactly predicts the next `tick()`. `node_states()` returns a deep copy so
+mutating it doesn't affect the run.
+
+### Tick lifecycle hooks
+
+```
+on_tick_start(tick, fireable[])   # before any node fires this tick
+  → engine runs (body/guard execute)
+  → on_fire(firing) × N           # after each node fires
+on_tick_end(tick, firings[])      # after all fires committed
+```
+
+```python
+rn.on_tick_start(lambda tick, fireable: ws.broadcast({"tick": tick, "fireable": fireable}))
+rn.on_fire(lambda firing: ws.broadcast({"fired": firing.node, "status": firing.status}))
+rn.on_tick_end(lambda tick, firings: ws.broadcast({"tick_done": tick}))
+```
+
+AsyncRunner accepts sync or `async def` hooks. Hook exceptions are logged and
+swallowed — a misbehaving observer can't corrupt the run.
+
+### Snapshot carries fireable
+
+```python
+snap = rn.snapshot()
+# snap["fireable"] == rn.fireable()  — front-end reads one dict and gets
+#                                       both state and "what's next"
+```
+
+`fireable` is derived from the marking but persisted in the snapshot so a
+front-end reading a saved snapshot (e.g. via backend) gets the preview without
+recomputing. On `restore()`, `fireable` is not read back — the restored
+marking is authoritative, so `rn.fireable()` is correct automatically.
+
+### Disabling in-memory audit
+
+For embedded / front-end-push scenarios where you don't need the in-memory
+audit log (you're streaming via hooks instead), turn it off to save memory:
+
+```python
+rn = Runner(graph, registry, enable_audit=False)
+```
+
+- `self.audit` stays empty; `tick()` doesn't accumulate.
+- **firings.jsonl backend persistence is unaffected** — `Backend.save_firing`
+  still runs every tick, so the process record survives for crash recovery.
+- `to_json()` emits `"audit": []`.
+
+### Where streaming LLM tokens go
+
+tickflow deliberately does **not** handle LLM token streaming — that's a
+call-level concern belonging to the harness/EventBus layer, not the flow
+engine. tickflow's hooks give the front-end coarse anchors ("node X is
+firing", "node X done with status ok"), while token chunks flow through a
+separate channel (e.g. ModularHarness's EventBus `llm_token` events). This
+keeps tickflow's audit/snapshot small (node-level, not token-level).
+
 ## CLI
 
 ```

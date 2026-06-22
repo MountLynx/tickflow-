@@ -163,3 +163,35 @@ def test_deepcopy_snapshot_for_branching():
     rn2 = Runner(g, r)
     rn2.restore(snap_b)
     assert rn2.tick_count == 3
+
+
+def test_snapshot_contains_fireable():
+    r = _loop_reg()
+    g = _loop_graph(r)
+    rn = Runner(g, r)
+    rn.run_until_idle(max_ticks=20, pause_at={3})
+    snap = rn.snapshot()
+    assert "fireable" in snap
+    assert set(snap["fireable"]) == set(rn.fireable())
+
+
+def test_snapshot_fireable_after_restore():
+    r = _loop_reg()
+    g = _loop_graph(r)
+    rn = Runner(g, r)
+    rn.run_until_idle(max_ticks=20, pause_at={3})
+    snap = rn.snapshot()
+    rn.run_until_idle(max_ticks=20)
+    rn.restore(snap)
+    # After restore, fireable() is recomputed from the restored marking and
+    # matches what the snapshot recorded.
+    assert set(rn.fireable()) == set(snap["fireable"])
+
+
+def test_snapshot_fireable_empty_at_terminal():
+    r = _loop_reg()
+    g = _loop_graph(r)
+    rn = Runner(g, r)
+    rn.run_until_idle(max_ticks=50)
+    snap = rn.snapshot()
+    assert snap["fireable"] == []

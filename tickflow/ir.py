@@ -127,3 +127,56 @@ class Graph:
             )
         g.edges = [Edge(src=e.src, dst=e.dst, guard=e.guard) for e in self.edges]
         return g
+
+    # --- export (for visualisation / front-end) ---------------------------
+
+    def to_dict(self) -> dict:
+        """Structured JSON-able view of the graph for front-end rendering.
+
+        Includes derived ``producers`` per node so the front-end doesn't have
+        to recompute adjacency. Output is plain data (JSON-serialisable).
+        """
+        return {
+            "nodes": {
+                name: {
+                    "is_start": n.is_start,
+                    "join": n.join,
+                    "body": n.body,
+                    "inputs": {
+                        k: {"kind": v.kind, "k": v.k}
+                        for k, v in n.inputs.items()
+                    },
+                    "producers": self.producers(name),
+                }
+                for name, n in self.nodes.items()
+            },
+            "edges": [
+                {"src": e.src, "dst": e.dst, "guard": e.guard} for e in self.edges
+            ],
+            "starts": self.starts,
+        }
+
+    def to_mermaid(self) -> str:
+        """Render the graph as mermaid ``graph TD`` text (for READMEs /
+        debuggers / any mermaid renderer).
+
+        - Start nodes use the stadium shape ``([name])``.
+        - Plain edges: ``A --> B``.
+        - Guarded edges: ``A -->|guard| B``.
+        - Nodes are emitted in sorted order for stable output.
+        """
+        lines = ["graph TD"]
+        # Declare nodes first (sorted) so shape/label is stable regardless of
+        # edge order. Non-start nodes need no explicit declaration (mermaid
+        # infers them from edges), but declaring starts gives the stadium shape.
+        for name in sorted(self.nodes):
+            node = self.nodes[name]
+            if node.is_start:
+                lines.append(f'    {name}(["{name}"])')
+        # Edges.
+        for e in self.edges:
+            if e.guard is None:
+                lines.append(f"    {e.src} --> {e.dst}")
+            else:
+                lines.append(f"    {e.src} -->|{e.guard}| {e.dst}")
+        return "\n".join(lines)

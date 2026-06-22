@@ -48,7 +48,7 @@ from typing import Any, Callable, Iterable
 
 from .ir import Graph
 from .registry import Registry, registry as _default_registry
-from .engine import Marking, History, tick, bootstrap, Firing
+from .engine import Marking, History, tick, bootstrap, Firing, _join_satisfied
 from .checker import check, DeadlockSuggestion, DeadlockError
 
 log = logging.getLogger(__name__)
@@ -69,6 +69,7 @@ class RunStatus(str, enum.Enum):
 # Hook type aliases.
 FireHook = Callable[[Firing], None]
 TickEndHook = Callable[[int, list[Firing]], None]
+TickStartHook = Callable[[int, list[str]], None]   # (tick, fireable_node_names)
 
 
 def _jsonable(v: Any) -> Any:
@@ -101,6 +102,7 @@ class Runner:
         strict_deadlock: bool = True,
         backend: Any = None,
         session_id: str | None = None,
+        enable_audit: bool = True,
     ) -> None:
         self.graph = graph
         self.registry = registry if registry is not None else _default_registry
@@ -108,6 +110,7 @@ class Runner:
         self.history: History = History()
         self.tick_count: int = 0
         self.audit: list[Firing] = []
+        self.enable_audit = enable_audit
         self.status: RunStatus = RunStatus.IDLE
         self.cancel_reason: str | None = None
         # Persistence (optional). When set, every tick's snapshot + each firing
@@ -117,6 +120,7 @@ class Runner:
         # Hooks.
         self._fire_hooks: list[FireHook] = []
         self._tick_end_hooks: list[TickEndHook] = []
+        self._tick_start_hooks: list[TickStartHook] = []
         if strict_deadlock:
             pending = check(graph)
             if pending:
@@ -137,6 +141,14 @@ class Runner:
         tick-level snapshot persistence."""
         self._tick_end_hooks.append(callback)
 
+    def on_tick_start(self, callback: TickStartHook) -> None:
+        """Register a callback invoked at the start of each tick, *before* any
+        node fires, with ``(tick_index, fireable_node_names)``. Use this to
+        tell a front-end "these nodes are about to light up". The fireable
+        list is computed from the current marking, identical to what the
+        engine will actually fire this tick."""
+        self._tick_start_hooks.append(callback)
+
     def _run_fire_hooks(self, firing: Firing) -> None:
         for cb in self._fire_hooks:
             try:
@@ -151,6 +163,27 @@ class Runner:
             except Exception:
                 log.exception("on_tick_end hook raised; swallowed")
 
+    def _run_tick_start_hooks(self, tick: int, fireable: list[str]) -> None:
+        for cb in self._tick_start_hooks:
+            try:
+                cb(tick, fireable)
+            except Exception:
+                log.exception("on_tick_start hook raised; swallowed")
+
+    # --- fireable / node state (read-only derived views) ------------------
+
+    def fireable(self) -> list[str]:
+        """Nodes that would fire on the next tick given the current marking
+        and join rules. Computed identically to the engine's internal check,
+        so the result equals the set of nodes the next ``tick()`` will fire.
+        Read-only; does not advance the run."""
+        return [n for n in self.graph.nodes if _join_satisfied(self.graph, n, self.marking)]
+
+    def node_states(self) -> dict[str, dict[str, Any]]:
+        """Read-only copy of every node's mutable state (e.g. retry counters).
+        Mutating the returned dicts does not affect the run."""
+        return {n: dict(s) for n, s in self.marking.node_state.items()}
+
     # --- core -------------------------------------------------------------
 
     def tick(self) -> list[Firing]:
@@ -160,11 +193,16 @@ class Runner:
         if an infrastructure Failure occurred."""
         if self.status in _TERMINAL:
             return []
+        # tick-start hooks fire before the engine runs, with the fireable set
+        # computed from the current (pre-tick) marking.
+        fireable = self.fireable()
+        self._run_tick_start_hooks(self.tick_count, fireable)
         next_marking, firings, aborted = tick(
             self.graph, self.marking, self.history, self.tick_count, self.registry
         )
         self.marking = next_marking
-        self.audit.extend(firings)
+        if self.enable_audit:
+            self.audit.extend(firings)
         # Fire hooks fire *before* tick_count increments, with the tick index
         # at which the fire logically occurred.
         for f in firings:
@@ -253,9 +291,11 @@ class Runner:
     # --- snapshot / restore ----------------------------------------------
 
     def snapshot(self) -> dict:
-        """JSON-able snapshot of (marking, history, tick, status). Does not
-        include the graph or registry -- those are structural/code and live
-        outside."""
+        """JSON-able snapshot of (marking, history, tick, status, fireable).
+        Does not include the graph or registry -- those are structural/code
+        and live outside. ``fireable`` is the set of nodes that would fire on
+        the next tick from this marking (derived, but persisted so a front-end
+        reading the snapshot once gets the "what's next" without recomputing)."""
         return {
             "tick": self.tick_count,
             "marking": self.marking.to_json(),
@@ -265,22 +305,30 @@ class Runner:
             },
             "status": self.status.value,
             "cancel_reason": self.cancel_reason,
+            "fireable": self.fireable(),
         }
 
     def restore(self, snap: dict) -> None:
         """Rewind to ``snap``. ``snap["tick"]`` is the *next* tick to fire
         (i.e. ticks ``0..snap["tick"]-1`` have already fired). History entries
         with ``tick >= snap["tick"]`` are dropped, and the audit log is
-        truncated to entries with ``tick < snap["tick"]``. Status is restored
-        and :meth:`reset` is called so ticking can resume if the restored
-        marking has pending work."""
+        truncated to entries with ``tick < snap["tick"]`` (only if audit is
+        enabled). Status is restored and terminal states reset to IDLE so
+        ticking can resume if the restored marking has pending work.
+
+        ``fireable`` is NOT read back -- it is derived from the marking, which
+        is the authoritative source, so ``self.fireable()`` after restore is
+        correct without it."""
         self.tick_count = int(snap["tick"])
         self.marking = Marking.from_json(snap["marking"])
         h = History()
         for n, lst in snap["history"].items():
             h.data[n] = [(int(t), v) for (t, v) in lst if int(t) < self.tick_count]
         self.history = h
-        self.audit = [f for f in self.audit if f.tick < self.tick_count]
+        if self.enable_audit:
+            self.audit = [f for f in self.audit if f.tick < self.tick_count]
+        else:
+            self.audit = []
         status_val = snap.get("status", RunStatus.IDLE.value)
         try:
             self.status = RunStatus(status_val)

@@ -135,6 +135,7 @@ class AsyncRunner:
         strict_deadlock: bool = True,
         backend: Any = None,
         session_id: str | None = None,
+        enable_audit: bool = True,
     ) -> None:
         from .checker import check, DeadlockError
         self.graph = graph
@@ -143,12 +144,14 @@ class AsyncRunner:
         self.history: History = History()
         self.tick_count: int = 0
         self.audit: list[Firing] = []
+        self.enable_audit = enable_audit
         self.status: RunStatus = RunStatus.IDLE
         self.cancel_reason: str | None = None
         self._backend = backend
         self._session_id = session_id
-        self._fire_hooks: list = []      # sync FireHook or AsyncFireHook
-        self._tick_end_hooks: list = []  # sync TickEndHook or AsyncTickEndHook
+        self._fire_hooks: list = []          # sync FireHook or AsyncFireHook
+        self._tick_end_hooks: list = []      # sync TickEndHook or AsyncTickEndHook
+        self._tick_start_hooks: list = []    # sync TickStartHook or async variant
         if strict_deadlock:
             pending = check(graph)
             if pending:
@@ -161,6 +164,12 @@ class AsyncRunner:
 
     def on_tick_end(self, callback) -> None:
         self._tick_end_hooks.append(callback)
+
+    def on_tick_start(self, callback) -> None:
+        """Register a callback invoked at the start of each tick, *before* any
+        node fires, with ``(tick_index, fireable_node_names)``. Accepts sync
+        or ``async def`` callbacks."""
+        self._tick_start_hooks.append(callback)
 
     async def _run_fire_hooks(self, firing: Firing) -> None:
         for cb in self._fire_hooks:
@@ -176,16 +185,39 @@ class AsyncRunner:
             except Exception:
                 log.exception("on_tick_end hook raised; swallowed")
 
+    async def _run_tick_start_hooks(self, tick: int, fireable: list[str]) -> None:
+        for cb in self._tick_start_hooks:
+            try:
+                await _maybe_await(cb, tick, fireable)
+            except Exception:
+                log.exception("on_tick_start hook raised; swallowed")
+
+    # --- fireable / node state (read-only derived views) ------------------
+
+    def fireable(self) -> list[str]:
+        """Nodes that would fire on the next tick given the current marking.
+        Computed identically to the engine's internal check. Read-only."""
+        return [n for n in self.graph.nodes if _join_satisfied(self.graph, n, self.marking)]
+
+    def node_states(self) -> dict[str, dict[str, Any]]:
+        """Read-only copy of every node's mutable state."""
+        return {n: dict(s) for n, s in self.marking.node_state.items()}
+
     # --- core -------------------------------------------------------------
 
     async def tick(self) -> list[Firing]:
         if self.status in _TERMINAL:
             return []
+        # tick-start hooks fire before the engine runs, with the fireable set
+        # computed from the current (pre-tick) marking.
+        fireable = self.fireable()
+        await self._run_tick_start_hooks(self.tick_count, fireable)
         next_marking, firings, aborted = await async_tick(
             self.graph, self.marking, self.history, self.tick_count, self.registry
         )
         self.marking = next_marking
-        self.audit.extend(firings)
+        if self.enable_audit:
+            self.audit.extend(firings)
         for f in firings:
             await self._run_fire_hooks(f)
         self.tick_count += 1
@@ -266,6 +298,7 @@ class AsyncRunner:
             },
             "status": self.status.value,
             "cancel_reason": self.cancel_reason,
+            "fireable": self.fireable(),
         }
 
     def restore(self, snap: dict) -> None:
@@ -275,7 +308,10 @@ class AsyncRunner:
         for n, lst in snap["history"].items():
             h.data[n] = [(int(t), v) for (t, v) in lst if int(t) < self.tick_count]
         self.history = h
-        self.audit = [f for f in self.audit if f.tick < self.tick_count]
+        if self.enable_audit:
+            self.audit = [f for f in self.audit if f.tick < self.tick_count]
+        else:
+            self.audit = []
         try:
             self.status = RunStatus(snap.get("status", RunStatus.IDLE.value))
         except ValueError:
@@ -284,6 +320,26 @@ class AsyncRunner:
         if self.status in _TERMINAL:
             self.status = RunStatus.IDLE
             self.cancel_reason = None
+
+    def to_json(self) -> str:
+        """Full state as a JSON string (snapshot + audit log). Counterpart of
+        :meth:`tickflow.runner.Runner.to_json`."""
+        import json
+        return json.dumps({
+            "snapshot": self.snapshot(),
+            "audit": [f.to_json() for f in self.audit],
+        }, indent=2, default=_jsonable)
+
+    @classmethod
+    def from_json(cls, s: str, graph: Graph, registry: Registry | None = None) -> "AsyncRunner":
+        """Reconstruct an AsyncRunner from a prior :meth:`to_json` dump. The
+        graph and registry must be supplied (not stored in the dump)."""
+        import json
+        d = json.loads(s)
+        r = cls(graph, registry, strict_deadlock=False)
+        r.restore(d["snapshot"])
+        r.audit = [Firing.from_json(f) for f in d["audit"]]
+        return r
 
     # --- checkpoints ------------------------------------------------------
 
@@ -309,6 +365,10 @@ class AsyncRunner:
 
     def audit_log(self) -> list[Firing]:
         return list(self.audit)
+
+    def audit_json(self) -> str:
+        import json
+        return json.dumps([f.to_json() for f in self.audit], indent=2, default=_jsonable)
 
     def last_output(self, node: str) -> Any:
         entries = self.history.data.get(node, [])

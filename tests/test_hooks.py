@@ -77,3 +77,71 @@ def test_multiple_hooks_all_called():
     rn.run_until_idle(max_ticks=20)
     assert a == ["A", "B"]
     assert b == ["A", "B"]
+
+
+def test_on_tick_start_called_before_fire():
+    r = _reg()
+    g = parse("[A]-->B\nB.body: ok\nA.body: ok", registry=r)
+    rn = Runner(g, r)
+    order = []
+
+    def on_start(tick, fireable):
+        order.append(("start", tick, list(fireable)))
+
+    def on_fire(f):
+        order.append(("fire", f.tick, f.node))
+
+    def on_end(tick, firings):
+        order.append(("end", tick, len(firings)))
+
+    rn.on_tick_start(on_start)
+    rn.on_fire(on_fire)
+    rn.on_tick_end(on_end)
+    rn.run_until_idle(max_ticks=20)
+    # tick 0: start(0, [A]) -> fire A -> end(0, 1)
+    assert order[0] == ("start", 0, ["A"])
+    assert order[1] == ("fire", 0, "A")
+    assert order[2] == ("end", 0, 1)
+
+
+def test_on_tick_start_fireable_matches_firings():
+    r = _reg()
+    g = parse("[A]-->C\n[B]-->C\nC.body: ok\nA.body: ok\nB.body: ok", registry=r)
+    rn = Runner(g, r)
+    captured = []
+    rn.on_tick_start(lambda tick, fireable: captured.append((tick, set(fireable))))
+    rn.run_until_idle(max_ticks=20)
+    # tick 0: A and B both fireable
+    assert captured[0] == (0, {"A", "B"})
+    # tick 1: C fireable
+    assert captured[1] == (1, {"C"})
+
+
+def test_on_tick_start_exception_swallowed():
+    r = _reg()
+    g = parse("[A]-->B\nB.body: ok\nA.body: ok", registry=r)
+    rn = Runner(g, r)
+
+    def bad(tick, fireable):
+        raise ValueError("boom")
+    rn.on_tick_start(bad)
+    rn.run_until_idle(max_ticks=20)
+    assert rn.is_terminal()
+
+
+def test_on_tick_start_async():
+    import asyncio
+    from tickflow.async_runner import AsyncRunner
+
+    r = Registry()
+    r.body("ok", lambda v: "ok")
+    g = parse("[A]-->B\nB.body: ok\nA.body: ok", registry=r)
+    rn = AsyncRunner(g, r)
+    starts = []
+
+    async def on_start(tick, fireable):
+        starts.append((tick, list(fireable)))
+
+    rn.on_tick_start(on_start)
+    asyncio.run(rn.run_until_idle(max_ticks=20))
+    assert starts[0] == (0, ["A"])
