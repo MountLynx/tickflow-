@@ -33,7 +33,10 @@ from .engine import (
     _join_satisfied, _resolve_inputs, _guard_view, _NodeStateView,
 )
 from .views import DictView
-from .runner import RunStatus, _TERMINAL, _jsonable, FireHook, TickEndHook
+from .runner import (
+    RunStatus, _TERMINAL, _jsonable, FireHook, TickEndHook,
+    _validate_registry_for_graph, _warn_graph_changes,
+)
 
 log = logging.getLogger(__name__)
 
@@ -235,8 +238,8 @@ class AsyncRunner:
         if self._backend is None or self._session_id is None:
             return
         try:
-            for f in firings:
-                self._backend.save_firing(self._session_id, f)
+            if firings:
+                self._backend.save_firings(self._session_id, firings)
             self._backend.save_snapshot(self._session_id, self.tick_count, self.snapshot())
         except Exception:
             log.exception("backend persistence failed; swallowed")
@@ -340,6 +343,79 @@ class AsyncRunner:
         r.restore(d["snapshot"])
         r.audit = [Firing.from_json(f) for f in d["audit"]]
         return r
+
+    # --- registry swap ----------------------------------------------------
+
+    def _validate_registry(self, registry: Registry) -> None:
+        """Raise ValueError if ``registry`` is missing any body or guard name
+        referenced by :attr:`graph`."""
+        _validate_registry_for_graph(self.graph, registry)
+
+    def set_registry(self, registry: Registry) -> None:
+        """Replace :attr:`registry` with a new :class:`Registry` instance.
+
+        Validates that the new registry provides every body and guard name
+        referenced by the graph. Call this between ticks or after a rollback
+        to hot-swap body/guard implementations without restarting the run.
+        """
+        _validate_registry_for_graph(self.graph, registry)
+        self.registry = registry
+
+    # --- graph remap ------------------------------------------------------
+
+    def remap_graph(
+        self,
+        new_graph: Graph,
+        registry: Registry | None = None,
+        *,
+        strict_deadlock: bool = True,
+    ) -> None:
+        """Replace :attr:`graph` with *new_graph*, porting the current marking.
+
+        Slots that exist in both graphs keep their current value (True tokens
+        are preserved). Slots in the new graph that didn't exist before start
+        at ``False``. Slots from the old graph that don't exist in the new
+        graph are discarded.
+
+        *registry*, if given, replaces :attr:`registry` at the same time
+        (validated against *new_graph*).
+        """
+        from .checker import check, DeadlockError
+
+        reg = registry if registry is not None else self.registry
+        _validate_registry_for_graph(new_graph, reg)
+
+        if strict_deadlock:
+            pending = check(new_graph)
+            if pending:
+                raise DeadlockError(pending)
+
+        _warn_graph_changes(self.graph, new_graph, self.history)
+
+        old_slots = self.marking.slots
+        new_slots: dict[tuple[str, str], bool] = {}
+        for e in new_graph.edges:
+            key = (e.dst, e.src)
+            new_slots[key] = old_slots.get(key, False)
+
+        new_armed = self.marking.armed_starts & set(new_graph.starts)
+
+        new_node_state = {
+            n: dict(s)
+            for n, s in self.marking.node_state.items()
+            if n in new_graph.nodes
+        }
+
+        self.marking = Marking(
+            slots=new_slots,
+            armed_starts=new_armed,
+            node_state=new_node_state,
+        )
+        self.graph = new_graph
+        self.registry = reg
+        # A remap may introduce new fireable work; reset so run_until_idle
+        # re-evaluates (mirrors restore()).
+        self.reset()
 
     # --- checkpoints ------------------------------------------------------
 

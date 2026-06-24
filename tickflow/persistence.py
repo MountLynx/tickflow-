@@ -16,9 +16,10 @@ Two reference implementations ship:
 - :class:`JsonBackend` -- one directory per session, ``tick_N.json`` +
   ``firings.jsonl`` + ``checkpoints.json``. Default; good for small/medium
   graphs and human inspection.
-- :class:`SqliteBackend` -- (planned, not in v1) a single DB with
-  ``snapshots`` / ``firings`` / ``checkpoints`` tables; better for high
-  tick-throughput and concurrent sessions.
+- :class:`SqliteBackend` -- a single DB file (SQLite) with ``snapshots`` /
+  ``firings`` / ``checkpoints`` tables; better for high tick-throughput
+  and concurrent sessions. Optional; use by passing
+  ``backend=SqliteBackend("path/to.db")`` to the Runner.
 
 A :class:`NullBackend` (in-memory) is provided for tests that want to exercise
 the persistence wiring without touching disk.
@@ -38,6 +39,7 @@ Design notes
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -70,8 +72,16 @@ class Backend(Protocol):
         ...
 
     def save_firing(self, session_id: str, firing: Any) -> None:
-        """Append a :class:`Firing` (or its JSON form) to the process log.
-        Append-only; never rewritten."""
+        """Append a single :class:`Firing` (or its JSON form) to the process
+        log. Append-only; never rewritten. Prefer :meth:`save_firings` (batch)
+        when persisting a whole tick."""
+        ...
+
+    def save_firings(self, session_id: str, firings: list) -> None:
+        """Append multiple firings in one batch (one transaction/fsync where
+        the backend supports it). Implementations should be equivalent to
+        calling :meth:`save_firing` for each element but cheaper. ``firings``
+        may be empty (no-op)."""
         ...
 
     def list_firings(self, session_id: str, since_tick: int = 0) -> list[dict]:
@@ -116,6 +126,12 @@ class NullBackend:
     def save_firing(self, session_id: str, firing: Any) -> None:
         d = firing.to_json() if hasattr(firing, "to_json") else dict(firing)
         self._firings.setdefault(session_id, []).append(d)
+
+    def save_firings(self, session_id: str, firings: list) -> None:
+        bucket = self._firings.setdefault(session_id, [])
+        for f in firings:
+            d = f.to_json() if hasattr(f, "to_json") else dict(f)
+            bucket.append(d)
 
     def list_firings(self, session_id: str, since_tick: int = 0) -> list[dict]:
         return [f for f in self._firings.get(session_id, []) if f.get("tick", 0) >= since_tick]
@@ -202,6 +218,17 @@ class JsonBackend:
         with self._firings_path(session_id).open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, default=_default) + "\n")
 
+    def save_firings(self, session_id: str, firings: list) -> None:
+        if not firings:
+            return
+        d = self._session_dir(session_id)
+        d.mkdir(parents=True, exist_ok=True)
+        # One open/flush for the whole batch -- avoids per-firing open fsync.
+        with self._firings_path(session_id).open("a", encoding="utf-8") as f:
+            for firing in firings:
+                payload = firing.to_json() if hasattr(firing, "to_json") else dict(firing)
+                f.write(json.dumps(payload, default=_default) + "\n")
+
     def list_firings(self, session_id: str, since_tick: int = 0) -> list[dict]:
         p = self._firings_path(session_id)
         if not p.exists():
@@ -245,6 +272,189 @@ class JsonBackend:
             return json.loads(p.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             return {}
+
+
+class SqliteBackend:
+    """SQLite backend: single DB file for snapshots, firings, and checkpoints.
+
+    Uses WAL journal mode for better concurrent read performance. A single
+    connection is opened at construction time with ``check_same_thread=False``
+    so the same backend can be shared by sync and async runners.
+
+    Thread safety
+    -------------
+    A single ``sqlite3.Connection`` is **not** safe for concurrent use from
+    multiple threads. This backend guards every write with an internal
+    :class:`threading.Lock`, so multiple threads sharing one ``SqliteBackend``
+    instance won't corrupt the database -- but writes serialise, and under
+    heavy contention you may see ``database is locked`` retries (caught and
+    re-raised here after the lock is released). For high-concurrency servers,
+    prefer one backend instance per thread/worker, or wrap calls in
+    ``asyncio.to_thread`` from a single async runner.
+
+    The parent directory of ``db_path`` is created automatically if it does
+    not exist (matching :class:`JsonBackend`). Pass ``":memory:"`` for an
+    in-memory database (useful for testing); note that ``:memory:`` databases
+    are per-connection, so two ``SqliteBackend(":memory:")`` instances do NOT
+    share data -- use ``"file::memory:?cache=shared"`` for that.
+
+    Parameters
+    ----------
+    db_path : str | Path
+        Path to the SQLite database file.
+    """
+
+    def __init__(self, db_path: str | Path) -> None:
+        import threading
+        self._db_path = Path(db_path)
+        # Don't create parent directories for :memory: or file: URIs.
+        _raw = str(db_path)
+        if _raw not in (":memory:",) and not _raw.startswith("file:"):
+            self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._lock = threading.Lock()
+        self._init_tables()
+
+    # -- schema -------------------------------------------------------------
+
+    def _init_tables(self) -> None:
+        """Create tables and indexes if they do not yet exist."""
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS snapshots (
+                session_id TEXT NOT NULL,
+                tick       INTEGER NOT NULL,
+                data       TEXT    NOT NULL,
+                PRIMARY KEY (session_id, tick)
+            );
+            CREATE TABLE IF NOT EXISTS firings (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT    NOT NULL,
+                tick       INTEGER NOT NULL,
+                data       TEXT    NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                session_id TEXT    NOT NULL,
+                label      TEXT    NOT NULL,
+                tick       INTEGER NOT NULL,
+                data       TEXT    NOT NULL,
+                PRIMARY KEY (session_id, label)
+            );
+            CREATE INDEX IF NOT EXISTS idx_firings_lookup
+                ON firings (session_id, tick, id);
+            """
+        )
+
+    # -- snapshots ----------------------------------------------------------
+
+    def save_snapshot(self, session_id: str, tick: int, snap: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO snapshots (session_id, tick, data) VALUES (?, ?, ?)",
+                (session_id, tick, json.dumps(snap, default=_default)),
+            )
+            self._conn.commit()
+
+    def load_snapshot(self, session_id: str, tick: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT data FROM snapshots WHERE session_id = ? AND tick = ?",
+                (session_id, tick),
+            ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def latest_tick(self, session_id: str) -> int | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(tick) FROM snapshots WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return row[0] if row and row[0] is not None else None
+
+    def list_snapshots(self, session_id: str) -> list[int]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT tick FROM snapshots WHERE session_id = ? ORDER BY tick",
+                (session_id,),
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    # -- firings ------------------------------------------------------------
+
+    def save_firing(self, session_id: str, firing: Any) -> None:
+        d = firing.to_json() if hasattr(firing, "to_json") else dict(firing)
+        tick = d.get("tick", 0)
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO firings (session_id, tick, data) VALUES (?, ?, ?)",
+                (session_id, tick, json.dumps(d, default=_default)),
+            )
+            self._conn.commit()
+
+    def save_firings(self, session_id: str, firings: list) -> None:
+        """Batch-insert all firings in a single transaction (one commit).
+        Cheaper than per-firing :meth:`save_firing` for a tick with N fires."""
+        if not firings:
+            return
+        rows = []
+        for firing in firings:
+            d = firing.to_json() if hasattr(firing, "to_json") else dict(firing)
+            rows.append((session_id, d.get("tick", 0), json.dumps(d, default=_default)))
+        with self._lock:
+            self._conn.executemany(
+                "INSERT INTO firings (session_id, tick, data) VALUES (?, ?, ?)",
+                rows,
+            )
+            self._conn.commit()
+
+    def list_firings(self, session_id: str, since_tick: int = 0) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT data FROM firings WHERE session_id = ? AND tick >= ? ORDER BY id",
+                (session_id, since_tick),
+            ).fetchall()
+        return [json.loads(r[0]) for r in rows]
+
+    # -- checkpoints --------------------------------------------------------
+
+    def save_checkpoint(self, session_id: str, label: str, snap: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO checkpoints (session_id, label, tick, data) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    session_id,
+                    label,
+                    snap.get("tick", 0),
+                    json.dumps(snap, default=_default),
+                ),
+            )
+            self._conn.commit()
+
+    def list_checkpoints(self, session_id: str) -> list[tuple[str, int]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT label, tick FROM checkpoints WHERE session_id = ? ORDER BY label",
+                (session_id,),
+            ).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    def load_checkpoint(self, session_id: str, label: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT data FROM checkpoints WHERE session_id = ? AND label = ?",
+                (session_id, label),
+            ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    # -- cleanup ------------------------------------------------------------
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+        """Close the underlying SQLite connection."""
+        self._conn.close()
 
 
 def _default(o: Any) -> Any:

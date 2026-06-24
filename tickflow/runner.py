@@ -54,6 +54,58 @@ from .checker import check, DeadlockSuggestion, DeadlockError
 log = logging.getLogger(__name__)
 
 
+def _validate_registry_for_graph(graph: Graph, registry: Registry) -> None:
+    """Raise ValueError if ``registry`` is missing any body or guard name
+    referenced by ``graph``."""
+    missing: list[str] = []
+    for node in graph.nodes.values():
+        if node.body is not None and not registry.has_body(node.body):
+            missing.append(f"body {node.body!r} (required by node {node.name!r})")
+    for edge in graph.edges:
+        if edge.guard is not None and not registry.has_guard(edge.guard):
+            missing.append(f"guard {edge.guard!r} (required by edge {edge.src}-->{edge.dst})")
+    if missing:
+        raise ValueError(
+            "registry missing required entries:\n  " + "\n  ".join(missing)
+        )
+
+
+def _warn_graph_changes(old: Graph, new: Graph, history: History) -> None:
+    """Validate/warn on structural changes between graphs.
+
+    - A node with history that becomes a start is an *error*: armed_starts are
+      one-shot, so such a node would silently never re-fire, breaking the
+      one-shot semantics the user expects from a start. The caller must
+      explicitly roll back to tick 0 (or construct a fresh marking) to re-arm.
+    - Removed nodes with history, and changed start sets, are warnings (the
+      user made a deliberate structural edit; we surface the consequence).
+    """
+    old_nodes = set(old.nodes)
+    new_nodes = set(new.nodes)
+
+    # Nodes removed that had history.
+    for n in sorted(old_nodes - new_nodes):
+        if n in history.data:
+            log.warning("Node %r removed but has history entries — data orphaned", n)
+
+    # Nodes that became starts but already have history: ERROR (one-shot break).
+    for n in sorted(old_nodes & new_nodes):
+        was_start = n in old.starts
+        is_start = n in new.starts
+        if not was_start and is_start and n in history.data:
+            raise ValueError(
+                f"Node {n!r} became a start but already has history — armed_starts "
+                f"are one-shot, so it would never re-fire. Roll back to tick 0 or "
+                f"construct a fresh marking to re-arm it."
+            )
+
+    if set(old.starts) != set(new.starts):
+        log.warning(
+            "Start node set changed: old=%s, new=%s",
+            sorted(old.starts), sorted(new.starts),
+        )
+
+
 class RunStatus(str, enum.Enum):
     """Lifecycle of a Runner. IDLE means "quiescent, may have work pending but
     nothing fired last tick" -- historically the only state. The terminal
@@ -220,12 +272,14 @@ class Runner:
         return firings
 
     def _persist_tick(self, firings: list[Firing]) -> None:
-        """Persist this tick's snapshot + firings to the backend, if any."""
+        """Persist this tick's snapshot + firings to the backend, if any.
+        Firings are written in a single batch call (one transaction) when the
+        backend supports it, to avoid per-firing fsync overhead."""
         if self._backend is None or self._session_id is None:
             return
         try:
-            for f in firings:
-                self._backend.save_firing(self._session_id, f)
+            if firings:
+                self._backend.save_firings(self._session_id, firings)
             self._backend.save_snapshot(self._session_id, self.tick_count, self.snapshot())
         except Exception:
             log.exception("backend persistence failed; swallowed")
@@ -316,6 +370,11 @@ class Runner:
         enabled). Status is restored and terminal states reset to IDLE so
         ticking can resume if the restored marking has pending work.
 
+        To swap the body/guard implementation or restructure the graph after a
+        rollback, call :meth:`set_registry` / :meth:`remap_graph` separately --
+        those validate against the (possibly new) graph. ``restore`` only
+        rewinds marking/history/tick/status.
+
         ``fireable`` is NOT read back -- it is derived from the marking, which
         is the authoritative source, so ``self.fireable()`` after restore is
         correct without it."""
@@ -360,6 +419,87 @@ class Runner:
         r.audit = [Firing.from_json(f) for f in d["audit"]]
         return r
 
+    # --- registry swap ----------------------------------------------------
+
+    def _validate_registry(self, registry: Registry) -> None:
+        """Raise ValueError if ``registry`` is missing any body or guard name
+        referenced by :attr:`graph`."""
+        _validate_registry_for_graph(self.graph, registry)
+
+    def set_registry(self, registry: Registry) -> None:
+        """Replace :attr:`registry` with a new :class:`Registry` instance.
+
+        Validates that the new registry provides every body and guard name
+        referenced by the graph. Call this between ticks or after a rollback
+        to hot-swap body/guard implementations without restarting the run.
+
+        The graph structure, marking, history, and tick are untouched — only
+        the lookup table for body/guard functions changes.
+        """
+        _validate_registry_for_graph(self.graph, registry)
+        self.registry = registry
+
+    # --- graph remap ------------------------------------------------------
+
+    def remap_graph(
+        self,
+        new_graph: Graph,
+        registry: Registry | None = None,
+        *,
+        strict_deadlock: bool = True,
+    ) -> None:
+        """Replace :attr:`graph` with *new_graph*, porting the current marking.
+
+        Slots that exist in both graphs keep their current value (True tokens
+        are preserved). Slots in the new graph that didn't exist before start
+        at ``False``. Slots from the old graph that don't exist in the new
+        graph are discarded.
+
+        *registry*, if given, replaces :attr:`registry` at the same time
+        (validated against *new_graph*).
+
+        Typical use: rollback to a checkpoint, then call ``remap_graph`` with
+        a structurally modified graph before resuming.
+        """
+        reg = registry if registry is not None else self.registry
+        _validate_registry_for_graph(new_graph, reg)
+
+        if strict_deadlock:
+            pending = check(new_graph)
+            if pending:
+                raise DeadlockError(pending)
+
+        _warn_graph_changes(self.graph, new_graph, self.history)
+
+        # Port slots: keep old value for edges that exist in both.
+        old_slots = self.marking.slots
+        new_slots: dict[tuple[str, str], bool] = {}
+        for e in new_graph.edges:
+            key = (e.dst, e.src)
+            new_slots[key] = old_slots.get(key, False)
+
+        # armed_starts: only keep those still marked as starts in the new graph.
+        new_armed = self.marking.armed_starts & set(new_graph.starts)
+
+        # node_state: carry over for nodes that exist in both graphs.
+        new_node_state = {
+            n: dict(s)
+            for n, s in self.marking.node_state.items()
+            if n in new_graph.nodes
+        }
+
+        self.marking = Marking(
+            slots=new_slots,
+            armed_starts=new_armed,
+            node_state=new_node_state,
+        )
+        self.graph = new_graph
+        self.registry = reg
+        # A remap may introduce new fireable work (new edges, new starts) even
+        # if the run was previously IDLE/terminal. Reset so run_until_idle
+        # re-evaluates -- mirrors restore()'s status reset.
+        self.reset()
+
     # --- checkpoints (named snapshots via backend) ------------------------
 
     def checkpoint(self, label: str) -> None:
@@ -375,7 +515,11 @@ class Runner:
         return self._backend.list_checkpoints(self._session_id)
 
     def rollback_to(self, label: str) -> None:
-        """Restore to a named checkpoint. Requires a backend + session_id."""
+        """Restore to a named checkpoint. Requires a backend + session_id.
+
+        Only rewinds marking/history/tick/status. To also swap the body/guard
+        implementation or restructure the graph, follow with
+        :meth:`set_registry` / :meth:`remap_graph`."""
         if self._backend is None or self._session_id is None:
             raise RuntimeError("rollback_to requires a backend and session_id")
         snap = self._backend.load_checkpoint(self._session_id, label)

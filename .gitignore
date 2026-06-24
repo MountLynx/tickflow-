@@ -62,3 +62,11 @@ out.json
 err.txt
 err2.txt
 snap.json
+
+# Windows reserved device names accidentally materialised as files by MSYS
+# bash (which doesn't honour `2>nul` the way cmd.exe does). Not real files.
+nul
+CON
+PRN
+AUX
+NUL

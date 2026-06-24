@@ -35,7 +35,7 @@ from .checker import check, promote, resolve_or_raise, DeadlockSuggestion, Deadl
 from .registry import Registry, registry, Body, Guard
 from .engine import Marking, History, tick, bootstrap, Firing
 from .runner import Runner, RunStatus
-from .persistence import Backend, JsonBackend
+from .persistence import Backend, JsonBackend, SqliteBackend
 
 __all__ = [
     "Graph",
@@ -63,4 +63,5 @@ __all__ = [
     "RunStatus",
     "Backend",
     "JsonBackend",
+    "SqliteBackend",
 ]
