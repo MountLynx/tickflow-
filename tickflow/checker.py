@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Static deadlock detection and OR-join promotion.
 
 Deadlock pattern
@@ -50,12 +52,13 @@ P_b in branch(e_b). This is sufficient to flag the deadlock; the user
 confirms intent.
 """
 
-from __future__ import annotations
-
+import logging
 from dataclasses import dataclass
 from typing import Iterable
 
 from .ir import Graph
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -183,6 +186,97 @@ def check(graph: Graph) -> list[DeadlockSuggestion]:
 def promote(suggestion: DeadlockSuggestion, graph: Graph) -> None:
     """Flip ``suggestion.node``'s join to OR in ``graph``. Idempotent."""
     graph.nodes[suggestion.node].join = "OR"
+
+
+# --- unguarded cycle detection -----------------------------------------------
+
+
+@dataclass
+class UnguardedCycleWarning:
+    """Warning: a cycle with no guarded edge will loop forever."""
+
+    nodes: list[str]  # node names in the strongly connected component
+
+    @property
+    def msg(self) -> str:
+        names = ", ".join(self.nodes)
+        return (
+            f"Cycle [{names}] has no guarded edge — it will loop forever "
+            f"without an exit condition. Add a guard (--|guard|-->) to at "
+            f"least one edge in the cycle."
+        )
+
+
+def _find_sccs(graph: Graph) -> list[set[str]]:
+    """Tarjan's algorithm: return all strongly connected components."""
+    index_counter = 0
+    indices: dict[str, int] = {}
+    lowlink: dict[str, int] = {}
+    on_stack: set[str] = set()
+    stack: list[str] = []
+    sccs: list[set[str]] = []
+
+    def _strongconnect(v: str) -> None:
+        nonlocal index_counter
+        indices[v] = index_counter
+        lowlink[v] = index_counter
+        index_counter += 1
+        stack.append(v)
+        on_stack.add(v)
+
+        for e in graph.out_edges(v):
+            w = e.dst
+            if w not in indices:
+                _strongconnect(w)
+                lowlink[v] = min(lowlink[v], lowlink[w])
+            elif w in on_stack:
+                lowlink[v] = min(lowlink[v], indices[w])
+
+        if lowlink[v] == indices[v]:
+            scc: set[str] = set()
+            while True:
+                w = stack.pop()
+                on_stack.discard(w)
+                scc.add(w)
+                if w == v:
+                    break
+            sccs.append(scc)
+
+    for node in graph.nodes:
+        if node not in indices:
+            _strongconnect(node)
+
+    return sccs
+
+
+def check_unguarded_cycles(graph: Graph) -> list[UnguardedCycleWarning]:
+    """Find cycles that have no guarded edge and will therefore loop forever.
+
+    Returns a list of warnings; does **not** mutate the graph.
+    """
+    sccs = _find_sccs(graph)
+    warnings: list[UnguardedCycleWarning] = []
+
+    for scc in sccs:
+        # Single-node SCC: only warn if it has a self-loop.
+        if len(scc) == 1:
+            node = next(iter(scc))
+            has_self_loop = any(
+                e.src == node and e.dst == node for e in graph.edges
+            )
+            if not has_self_loop:
+                continue
+
+        # Edges where both src and dst are inside this SCC.
+        internal = [e for e in graph.edges if e.src in scc and e.dst in scc]
+        if not internal:
+            continue
+
+        # If NO internal edge is guarded → guaranteed infinite loop.
+        if not any(e.guard is not None for e in internal):
+            warnings.append(UnguardedCycleWarning(nodes=sorted(scc)))
+
+    return warnings
 
 
 def resolve_or_raise(graph: Graph, suggestions: Iterable[DeadlockSuggestion]) -> None:

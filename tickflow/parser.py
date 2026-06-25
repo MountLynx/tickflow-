@@ -46,12 +46,16 @@ Errors raise :class:`ParseError` with the line number and a message.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import Iterable
 
 from .ir import Graph, Node, Edge, InputPolicy
 from .registry import Registry, registry as _default_registry
+from .checker import check_unguarded_cycles
+
+log = logging.getLogger(__name__)
 
 
 _NAME = r"[A-Za-z_][A-Za-z0-9_]*"
@@ -186,6 +190,11 @@ def parse(text: str, registry: Registry | None = None) -> Graph:
             node.inputs.setdefault(prod, InputPolicy.latest())
 
     _validate(g, reg, len(text.splitlines()))
+
+    # Warn about cycles with no guarded edge (potential infinite loops).
+    for w in check_unguarded_cycles(g):
+        log.warning(w.msg)
+
     return g
 
 

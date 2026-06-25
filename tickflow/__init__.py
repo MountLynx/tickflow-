@@ -31,7 +31,15 @@ rewind. See ``runner.Runner``.
 
 from .ir import Graph, Node, Edge, InputPolicy, Failure
 from .parser import parse, ParseError
-from .checker import check, promote, resolve_or_raise, DeadlockSuggestion, DeadlockError
+from .checker import (
+    check,
+    promote,
+    resolve_or_raise,
+    DeadlockSuggestion,
+    DeadlockError,
+    check_unguarded_cycles,
+    UnguardedCycleWarning,
+)
 from .registry import Registry, registry, Body, Guard
 from .engine import Marking, History, tick, bootstrap, Firing
 from .runner import Runner, RunStatus
@@ -50,6 +58,8 @@ __all__ = [
     "resolve_or_raise",
     "DeadlockSuggestion",
     "DeadlockError",
+    "check_unguarded_cycles",
+    "UnguardedCycleWarning",
     "Registry",
     "registry",
     "Body",
