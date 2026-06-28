@@ -46,7 +46,7 @@ def test_loop_terminates_when_guard_false():
     )
     rn = Runner(g, r)
     rn.run_until_idle(max_ticks=50)
-    b_outputs = [f.output for f in rn.audit if f.node == "B"]
+    b_outputs = [f.output for f in rn.audit_log() if f.node == "B"]
     assert b_outputs == [1, 2, 3]
     assert rn.is_idle()
 
@@ -61,7 +61,7 @@ def test_loop_latest_before_no_same_iteration_crosstalk():
     )
     rn = Runner(g, r)
     rn.run_until_idle(max_ticks=50)
-    a_outputs = [f.output for f in rn.audit if f.node == "A"]
+    a_outputs = [f.output for f in rn.audit_log() if f.node == "A"]
     # A: seed=0 at tick1, then B's prev: 1, 2 (B=3 doesn't loop back, guard false)
     assert a_outputs == [0, 1, 2]
 
@@ -93,10 +93,10 @@ def test_index_policy_pins_specific_fire():
     rn = Runner(g, r)
     rn.run_until_idle(max_ticks=50)
     # C fires each time A fires, always seeing A's 1st fire (value 0).
-    c_outputs = [f.output for f in rn.audit if f.node == "C"]
+    c_outputs = [f.output for f in rn.audit_log() if f.node == "C"]
     assert all(o == 0 for o in c_outputs)
     # A fired 3 times (values 0, 1, 2).
-    a_outputs = [f.output for f in rn.audit if f.node == "A"]
+    a_outputs = [f.output for f in rn.audit_log() if f.node == "A"]
     assert a_outputs == [0, 1, 2]
 
 
@@ -109,7 +109,7 @@ def test_index_out_of_range_yields_missing():
     rn = Runner(g, r)
     rn.run_until_idle(max_ticks=20)
     # A fired once (value 0); A[5] doesn't exist -> Missing -> passthru None.
-    c_fires = [f for f in rn.audit if f.node == "C"]
+    c_fires = [f for f in rn.audit_log() if f.node == "C"]
     assert len(c_fires) == 1
     assert c_fires[0].output is None  # passthru found no non-Missing input
 

@@ -118,7 +118,7 @@ def test_guard_failure_writes_false_not_stale_true():
     rn.run_until_idle(max_ticks=20)
     # B should reach value 3 then stop (guard fails -> writes False -> A
     # doesn't re-fire -> loop terminates).
-    b_outputs = [f.output for f in rn.audit if f.node == "B"]
+    b_outputs = [f.output for f in rn.audit_log() if f.node == "B"]
     assert b_outputs == [1, 2, 3]
     assert rn.is_idle()
 
@@ -146,7 +146,7 @@ def test_start_fires_exactly_once():
     g = parse("[A]-->B\nB.body: passthru", registry=r)
     rn = Runner(g, r)
     rn.run_until_idle(max_ticks=20)
-    a_fires = [f for f in rn.audit if f.node == "A"]
+    a_fires = [f for f in rn.audit_log() if f.node == "A"]
     assert len(a_fires) == 1
 
 

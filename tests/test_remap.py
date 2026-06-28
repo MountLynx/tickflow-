@@ -159,7 +159,7 @@ def test_remap_history_node_becomes_start_raises():
     r = _chain_reg()
     rn = Runner(_chain_graph(r), r)
     rn.run_until_idle(max_ticks=20)  # seed, A, B all have history now
-    assert "seed" in rn.history.data  # has history
+    assert "seed" in rn.run_state.edges  # has history
 
     # Make 'seed' (which has history) ... it's already a start, so use A:
     # A has history (fired), and is not a start. Promote it to start -> error.
@@ -259,7 +259,7 @@ def test_remap_add_edge_source_refires():
 
     # A fires again → Phase B sets (B,A)=True → B fires.
     rn.run_until_idle(max_ticks=20)
-    b_fired = any(f.node == "B" for f in rn.audit)
+    b_fired = any(f.node == "B" for f in rn.audit_log())
     assert b_fired
 
 
@@ -289,7 +289,7 @@ def test_rollback_remap_resume():
     assert rn.marking.slots[("B", "A")] is False
 
     rn.run_until_idle(max_ticks=20)
-    b_fired = any(f.node == "B" for f in rn.audit)
+    b_fired = any(f.node == "B" for f in rn.audit_log())
     assert b_fired
 
 

@@ -1,0 +1,20 @@
+# Fan-out: source fans out to three parallel workers, then Merge AND-joins
+# their results. Demonstrates AND-join waiting for all branches.
+#
+# Run:
+#   python -m tickflow run examples/fan_out.txt -b examples/fan_out_beh.py
+
+[source]-->worker_a
+[source]-->worker_b
+[source]-->worker_c
+source.body: seed_num
+worker_a.body: do_work
+worker_b.body: do_work
+worker_c.body: do_work
+worker_a.inputs: source
+worker_b.inputs: source
+worker_c.inputs: source
+worker_a-->merge
+worker_b-->merge
+worker_c-->merge
+merge.body: combine

@@ -215,15 +215,59 @@ def _validate(g: Graph, reg: Registry, n_lines: int) -> None:
     for name, node in g.nodes.items():
         if node.body is not None and not reg.has_body(node.body):
             raise ParseError(f"body '{node.body}' for node {name!r} not registered", n_lines)
-    # declared-input producers must actually be producers (warn-level: raise
-    # to catch typos early -- a body reading a non-producer would always get
-    # Missing).
+    # Build upstream closure: upstream[n] = all nodes that can reach n via
+    # directed edges.  Used to validate non-producer inputs below.
+    upstream: dict[str, set[str]] = {n: set() for n in g.nodes}
+    for e in g.edges:
+        upstream[e.dst].add(e.src)
+    # Transitive closure (fixed-point iteration; O(N³) worst case, N is tiny).
+    changed = True
+    while changed:
+        changed = False
+        for n in g.nodes:
+            prev = len(upstream[n])
+            new_ancestors: set[str] = set()
+            for a in upstream[n]:
+                new_ancestors.update(upstream[a])
+            upstream[n].update(new_ancestors)
+            if len(upstream[n]) > prev:
+                changed = True
+
+    # Validate inputs: existence, upstream reachability, bodyless producers.
     for name, node in g.nodes.items():
         producers = set(g.producers(name))
         for src in node.inputs:
-            if src not in producers:
+            # Input node must exist in the graph.
+            if src not in g.nodes:
                 raise ParseError(
-                    f"node {name!r} declares input from {src!r} which is not a producer "
-                    f"(producers: {sorted(producers) or 'none'})",
+                    f"node {name!r} declares input from {src!r} which is not "
+                    f"a node in the graph",
                     n_lines,
+                )
+            if src not in producers:
+                # Non-producer: must be upstream (fires before consumer).
+                if src not in upstream.get(name, set()):
+                    raise ParseError(
+                        f"node {name!r} declares input from {src!r} which is not a "
+                        f"producer and has no directed path to {name!r} — "
+                        f"{src!r} fires after or independently of {name!r}, "
+                        f"so the input will always be Missing",
+                        n_lines,
+                    )
+                log.warning(
+                    "node %r declares input from %r which is not a producer "
+                    "(producers: %s) — resolution will use history, not token flow",
+                    name, src, sorted(producers) or 'none',
+                )
+
+    # Warn on inputs from bodyless nodes (the resolved value will be None).
+    for name, node in g.nodes.items():
+        for src in node.inputs:
+            producer_node = g.nodes.get(src)
+            if producer_node is not None and producer_node.body is None:
+                log.warning(
+                    "node %r reads input from %r which has no body — "
+                    "the resolved value will be None (identity body). "
+                    "Assign a body to %r if you need it to produce data.",
+                    name, src, src,
                 )

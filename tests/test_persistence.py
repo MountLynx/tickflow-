@@ -48,7 +48,7 @@ def test_null_backend_records_snapshots_and_firings():
     assert snaps == list(range(1, rn.tick_count + 1))
     # Firings recorded.
     fs = be.list_firings("s1")
-    assert len(fs) == len(rn.audit)
+    assert len(fs) == len(rn.audit_log())
 
 
 def test_null_backend_latest_tick():
@@ -75,7 +75,7 @@ def test_json_backend_writes_files(tmp_path):
     fpath = sess_dir / "firings.jsonl"
     assert fpath.exists()
     lines = [l for l in fpath.read_text(encoding="utf-8").splitlines() if l.strip()]
-    assert len(lines) == len(rn.audit)
+    assert len(lines) == len(rn.audit_log())
 
 
 def test_json_backend_load_snapshot(tmp_path):
@@ -101,7 +101,7 @@ def test_json_backend_list_firings_since(tmp_path):
     # Firings from tick 3 onward.
     since3 = be.list_firings("s1", since_tick=3)
     assert all(f["tick"] >= 3 for f in since3)
-    assert len(since3) < len(rn.audit)
+    assert len(since3) < len(rn.audit_log())
 
 
 def test_runner_without_backend_no_persistence(tmp_path):
@@ -132,8 +132,8 @@ def test_persisted_snapshot_restores_into_new_runner(tmp_path):
     rn3.run_until_idle(max_ticks=20)
     # Compare firings from tick 3 onward (rn2's audit starts empty at restore;
     # rn3's audit has ticks 0..2 from its first run). Both resumed identically.
-    rn2_from3 = [(f.tick, f.node, f.output) for f in rn2.audit if f.tick >= 3]
-    rn3_from3 = [(f.tick, f.node, f.output) for f in rn3.audit if f.tick >= 3]
+    rn2_from3 = [(f.tick, f.node, f.output) for f in rn2.audit_log() if f.tick >= 3]
+    rn3_from3 = [(f.tick, f.node, f.output) for f in rn3.audit_log() if f.tick >= 3]
     assert rn2_from3 == rn3_from3
 
 
@@ -251,7 +251,7 @@ def test_sqlite_backend_records_snapshots_and_firings(tmp_path):
     snaps = be.list_snapshots("s1")
     assert snaps == list(range(1, rn.tick_count + 1))
     fs = be.list_firings("s1")
-    assert len(fs) == len(rn.audit)
+    assert len(fs) == len(rn.audit_log())
 
 
 def test_sqlite_backend_restore_runner(tmp_path):
@@ -269,6 +269,6 @@ def test_sqlite_backend_restore_runner(tmp_path):
     rn3 = Runner(_loop_graph(r3), r3)
     rn3.run_until_idle(max_ticks=20, pause_at={3})
     rn3.run_until_idle(max_ticks=20)
-    rn2_from3 = [(f.tick, f.node, f.output) for f in rn2.audit if f.tick >= 3]
-    rn3_from3 = [(f.tick, f.node, f.output) for f in rn3.audit if f.tick >= 3]
+    rn2_from3 = [(f.tick, f.node, f.output) for f in rn2.audit_log() if f.tick >= 3]
+    rn3_from3 = [(f.tick, f.node, f.output) for f in rn3.audit_log() if f.tick >= 3]
     assert rn2_from3 == rn3_from3

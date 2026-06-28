@@ -38,13 +38,13 @@ def test_llm_failure_writes_false_downstream():
     g = parse("[A]-->B\nA.body: fail_llm\nB.body: passthru", registry=r)
     rn = Runner(g, r)
     rn.tick()  # A fires, fails (llm)
-    assert rn.audit[-1].node == "A"
-    assert rn.audit[-1].status == "failed"
-    assert rn.audit[-1].error == "bad output"
+    assert rn.audit_log()[-1].node == "A"
+    assert rn.audit_log()[-1].status == "failed"
+    assert rn.audit_log()[-1].error == "bad output"
     # B's slot (B,A) is False; B never fires; next tick is idle.
     rn.tick()
     assert rn.is_idle()
-    assert not any(f.node == "B" for f in rn.audit)
+    assert not any(f.node == "B" for f in rn.audit_log())
 
 
 def test_llm_failure_does_not_abort_run():
@@ -53,7 +53,7 @@ def test_llm_failure_does_not_abort_run():
     g = parse("[A]-->B\nA.body: fail_llm\nB.body: passthru\n[C]-->D\nD.body: ok\nC.body: ok", registry=r)
     rn = Runner(g, r)
     rn.run_until_idle(max_ticks=20)
-    nodes = {f.node for f in rn.audit}
+    nodes = {f.node for f in rn.audit_log()}
     # A failed, B never ran; C and D ran fine.
     assert "A" in nodes and "C" in nodes and "D" in nodes
     assert "B" not in nodes
@@ -67,7 +67,7 @@ def test_infrastructure_failure_aborts_run():
     rn.run_until_idle(max_ticks=20)
     # A aborted; further ticks no-op.
     assert rn.status.value == "aborted"
-    a_fire = [f for f in rn.audit if f.node == "A"][0]
+    a_fire = [f for f in rn.audit_log() if f.node == "A"][0]
     assert a_fire.status == "aborted"
     assert a_fire.error == "network down"
 
@@ -79,9 +79,9 @@ def test_aborted_runner_stops_ticking():
     rn.run_until_idle(max_ticks=20)
     assert rn.status.value == "aborted"
     # Subsequent ticks are no-ops.
-    before = len(rn.audit)
+    before = len(rn.audit_log())
     rn.tick()
-    assert len(rn.audit) == before
+    assert len(rn.audit_log()) == before
 
 
 def test_failure_still_consumes_slots_and_writes_history():
@@ -92,7 +92,7 @@ def test_failure_still_consumes_slots_and_writes_history():
     # A's input slots consumed (it was a start, disarmed).
     assert "A" not in rn.marking.armed_starts
     # A's output is in history (the Failure object, serialized).
-    assert rn.history.data.get("A")
+    assert rn.run_state.edges.get("A")
 
 
 def test_failure_in_firing_to_json():
@@ -100,11 +100,11 @@ def test_failure_in_firing_to_json():
     g = parse("[A]-->B\nA.body: fail_llm\nB.body: ok\nA.body: fail_llm", registry=r)
     rn = Runner(g, r)
     rn.tick()
-    j = rn.audit[-1].to_json()
+    j = rn.audit_log()[-1].to_json()
     assert j["status"] == "failed"
     assert j["error"] == "bad output"
     # Round-trip.
-    from tickflow.engine import Firing
+    from tickflow import NodeState as Firing  # noqa: F811
     f2 = Firing.from_json(j)
     assert f2.status == "failed"
     assert f2.error == "bad output"

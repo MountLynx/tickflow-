@@ -1,0 +1,14 @@
+# Retry loop: B retries up to 3 times on Failure, then exits.
+#
+# Demonstrates: mutable_state (retry counter), Failure handling (llm type),
+# guard reading view.state, loop termination.
+#
+# Run:
+#   python -m tickflow run examples/retry_loop.txt -b examples/retry_loop_beh.py
+
+[start]-->B
+B.body: retry_task
+B.join: OR
+B--|should_retry|-->B
+B--|give_up|-->done
+done.body: finalize

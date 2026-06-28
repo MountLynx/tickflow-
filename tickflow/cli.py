@@ -46,12 +46,23 @@ def _resolve_deadlocks(graph, args) -> None:
         return
     if args.no_promote:
         raise DeadlockError(sugs)
-    for s in sugs:
-        print(s.msg, file=sys.stderr)
-        if args.auto_promote:
+    if args.auto_promote:
+        for s in sugs:
+            print(s.msg, file=sys.stderr)
             print("  (auto-promoting to OR-join)", file=sys.stderr)
             promote(s, graph)
-            continue
+        return
+    # No flag given: interactive if TTY, error otherwise.
+    if not sys.stdin.isatty():
+        raise SystemExit(
+            "Deadlock(s) detected but no --auto-promote or --no-promote given "
+            "and stdin is not a terminal.\n\n"
+            + "\n".join(s.msg for s in sugs) +
+            "\n\nUse --auto-promote to accept all suggestions, "
+            "or --no-promote to reject and error out."
+        )
+    for s in sugs:
+        print(s.msg, file=sys.stderr)
         ans = input("  promote to OR-join? [y/N] ").strip().lower()
         if ans == "y":
             promote(s, graph)
@@ -98,7 +109,10 @@ def _cmd_snapshot(args) -> int:
 def _cmd_audit(args) -> int:
     import json
     data = json.loads(Path(args.run).read_text(encoding="utf-8"))
-    for e in data.get("audit", []):
+    # Audit records live under snapshot → run_state → records.
+    records = data.get("audit", []) or \
+              data.get("snapshot", {}).get("run_state", {}).get("records", [])
+    for e in records:
         edges = ", ".join(f"{e2[0]}({e2[1] or '-'})={'T' if e2[2] else 'F'}" for e2 in e["edges_fired"])
         print(f"t{e['tick']:>3} {e['node']:<10} out={e['output']!r:<20} [{edges}]")
     return 0

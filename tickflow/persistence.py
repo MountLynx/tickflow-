@@ -4,7 +4,7 @@ The :class:`Backend` protocol is the storage abstraction flow's :class:`Runner`
 talks to. A Runner constructed with ``backend=...`` and ``session_id=...``
 persists, at the end of every tick:
 
-- each :class:`Firing` (the "process record" -- 全过程记录), and
+- each :class:`~tickflow.state.NodeState` (the "process record" -- 全过程记录), and
 - a full :meth:`Runner.snapshot` at the new tick index (the "tick-level
   checkpoint" -- 快照粒度一个 tick, per 重构.md).
 
@@ -72,9 +72,9 @@ class Backend(Protocol):
         ...
 
     def save_firing(self, session_id: str, firing: Any) -> None:
-        """Append a single :class:`Firing` (or its JSON form) to the process
-        log. Append-only; never rewritten. Prefer :meth:`save_firings` (batch)
-        when persisting a whole tick."""
+        """Append a single :class:`~tickflow.state.NodeState` (or its JSON form)
+        to the process log. Append-only; never rewritten. Prefer
+        :meth:`save_firings` (batch) when persisting a whole tick."""
         ...
 
     def save_firings(self, session_id: str, firings: list) -> None:
@@ -153,7 +153,7 @@ class JsonBackend:
     Layout (under ``storage_dir/<session_id>/``)::
 
         tick_<N>.json     # snapshot after tick N (N = next tick to fire)
-        firings.jsonl     # append-only process log, one Firing per line
+        firings.jsonl     # append-only process log, one NodeState per line
         checkpoints.json  # {label: snapshot_dict}
 
     Snapshots are full-state and overwrite-in-place. ``firings.jsonl`` is

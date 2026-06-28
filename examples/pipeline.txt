@@ -1,0 +1,14 @@
+# Three-stage pipeline: A → B → C.
+# C uses A[1] to pin A's first ever output. A is NOT a producer of C
+# (no A→C edge), but inputs are now decoupled from producers — C can
+# read A's history via A[1] without receiving a token from A.
+#
+# Run:
+#   python -m tickflow run examples/pipeline.txt -b examples/pipeline_beh.py
+
+[A]-->B
+A.body: seed_value
+B.body: transform
+B-->C
+C.body: reference_first
+C.inputs: A[1]

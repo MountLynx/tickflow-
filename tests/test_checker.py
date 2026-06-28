@@ -62,7 +62,7 @@ def test_after_promote_runner_constructs_and_runs():
     r = Runner(g, _reg())
     r.run_until_idle(max_ticks=20)
     # B fires once, picks go_a; A fires; Merge fires (OR). D never fires.
-    nodes_fired = {f.node for f in r.audit}
+    nodes_fired = {f.node for f in r.audit_log()}
     assert "B" in nodes_fired and "A" in nodes_fired and "Merge" in nodes_fired
     assert "D" not in nodes_fired
 

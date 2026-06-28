@@ -39,9 +39,9 @@ def test_cancel_mid_run_then_tick_noop():
     rn.tick()  # A fires -> RUNNING
     rn.cancel("mid")
     assert rn.status == RunStatus.CANCELLED
-    before = len(rn.audit)
+    before = len(rn.audit_log())
     rn.tick()
-    assert len(rn.audit) == before  # B never fires
+    assert len(rn.audit_log()) == before  # B never fires
 
 
 def test_infra_failure_sets_aborted():

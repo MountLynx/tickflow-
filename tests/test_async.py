@@ -45,7 +45,7 @@ def test_async_loop_terminates():
     r = _reg()
     rn = AsyncRunner(_loop_graph(r), r)
     _run(rn.run_until_idle(max_ticks=50))
-    b_outputs = [f.output for f in rn.audit if f.node == "B"]
+    b_outputs = [f.output for f in rn.audit_log() if f.node == "B"]
     assert b_outputs == [1, 2, 3]
     assert rn.is_idle()
 
@@ -61,7 +61,7 @@ def test_async_body_can_be_async_def():
     g = parse("[A]-->B\nB.body: async_val\nA.body: async_val", registry=r)
     rn = AsyncRunner(g, r)
     _run(rn.run_until_idle(max_ticks=20))
-    assert [f.output for f in rn.audit if f.node == "B"] == [42]
+    assert [f.output for f in rn.audit_log() if f.node == "B"] == [42]
 
 
 def test_async_guard_can_be_async_def():
@@ -80,7 +80,7 @@ def test_async_guard_can_be_async_def():
     g = parse("[A]-->B\nB.body: counter\nB--|under_three|-->B\nB.join: OR", registry=r)
     rn = AsyncRunner(g, r)
     _run(rn.run_until_idle(max_ticks=20))
-    assert [f.output for f in rn.audit if f.node == "B"] == [1, 2, 3]
+    assert [f.output for f in rn.audit_log() if f.node == "B"] == [1, 2, 3]
 
 
 def test_async_concurrent_firing():
@@ -99,7 +99,7 @@ def test_async_concurrent_firing():
     rn = AsyncRunner(g, r)
     _run(rn.run_until_idle(max_ticks=20))
     # A and B both fire at tick 0 concurrently.
-    tick0 = [f.node for f in rn.audit if f.tick == 0]
+    tick0 = [f.node for f in rn.audit_log() if f.tick == 0]
     assert set(tick0) == {"A", "B"}
 
 
@@ -115,7 +115,7 @@ def test_async_failure_infra_aborts():
     rn = AsyncRunner(g, r)
     _run(rn.run_until_idle(max_ticks=20))
     assert rn.status == RunStatus.ABORTED
-    assert not any(f.node == "B" for f in rn.audit)
+    assert not any(f.node == "B" for f in rn.audit_log())
 
 
 def test_async_hooks_called():
@@ -143,7 +143,7 @@ def test_async_persistence(tmp_path):
     rn = AsyncRunner(_loop_graph(r), r, backend=be, session_id="s1")
     _run(rn.run_until_idle(max_ticks=20))
     assert be.latest_tick("s1") == rn.tick_count
-    assert len(be.list_firings("s1")) == len(rn.audit)
+    assert len(be.list_firings("s1")) == len(rn.audit_log())
 
 
 def test_async_checkpoint_rollback():
@@ -154,11 +154,11 @@ def test_async_checkpoint_rollback():
     _run(rn.run_until_idle(max_ticks=20, pause_at={3}))
     rn.checkpoint("cp3")
     _run(rn.run_until_idle(max_ticks=20))
-    final = [(f.tick, f.node, f.output) for f in rn.audit]
+    final = [(f.tick, f.node, f.output) for f in rn.audit_log()]
     rn.rollback_to("cp3")
     assert rn.tick_count == 3
     _run(rn.run_until_idle(max_ticks=20))
-    assert [(f.tick, f.node, f.output) for f in rn.audit] == final
+    assert [(f.tick, f.node, f.output) for f in rn.audit_log()] == final
 
 
 def test_async_snapshot_restore_matches_sync():
@@ -170,4 +170,4 @@ def test_async_snapshot_restore_matches_sync():
     r2 = _reg()
     rn_async = AsyncRunner(_loop_graph(r2), r2)
     _run(rn_async.run_until_idle(max_ticks=50))
-    assert [f.output for f in rn_sync.audit] == [f.output for f in rn_async.audit]
+    assert [f.output for f in rn_sync.audit_log()] == [f.output for f in rn_async.audit_log()]

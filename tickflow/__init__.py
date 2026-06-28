@@ -41,7 +41,8 @@ from .checker import (
     UnguardedCycleWarning,
 )
 from .registry import Registry, registry, Body, Guard
-from .engine import Marking, History, tick, bootstrap, Firing
+from .engine import Marking, tick, bootstrap
+from .state import NodeState, RunState
 from .runner import Runner, RunStatus
 from .persistence import Backend, JsonBackend, SqliteBackend
 
@@ -65,10 +66,10 @@ __all__ = [
     "Body",
     "Guard",
     "Marking",
-    "History",
+    "NodeState",
+    "RunState",
     "tick",
     "bootstrap",
-    "Firing",
     "Runner",
     "RunStatus",
     "Backend",

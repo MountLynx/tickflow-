@@ -60,14 +60,14 @@ def test_restore_replays_identically():
     snap = rn.snapshot()
     # Finish the run.
     rn.run_until_idle(max_ticks=20)
-    final = [(f.tick, f.node, f.output) for f in rn.audit]
+    final = [(f.tick, f.node, f.output) for f in rn.audit_log()]
     # Restore to the snapshot and replay.
     rn.restore(snap)
     assert rn.tick_count == snap["tick"]
     # Audit truncated to ticks < snap["tick"].
-    assert all(f.tick < snap["tick"] for f in rn.audit)
+    assert all(f.tick < snap["tick"] for f in rn.audit_log())
     rn.run_until_idle(max_ticks=20)
-    replayed = [(f.tick, f.node, f.output) for f in rn.audit]
+    replayed = [(f.tick, f.node, f.output) for f in rn.audit_log()]
     assert replayed == final
 
 
@@ -79,10 +79,10 @@ def test_restore_truncates_history():
     snap = rn.snapshot()
     rn.run_until_idle(max_ticks=20)
     # After full run, history has entries beyond snap tick.
-    assert any(t >= snap["tick"] for lst in rn.history.data.values() for (t, _) in lst)
+    assert any(t >= snap["tick"] for lst in rn.run_state.edges.values() for (t, _) in lst)
     rn.restore(snap)
     # After restore, no history entry at or beyond snap tick.
-    for lst in rn.history.data.values():
+    for lst in rn.run_state.edges.values():
         for (t, _) in lst:
             assert t < snap["tick"]
 
@@ -94,7 +94,7 @@ def test_pause_at_stops_before_firing():
     rn.run_until_idle(max_ticks=20, pause_at={4})
     # Stopped at tick boundary 4: ticks 0..3 fired, tick 4 not yet.
     assert rn.tick_count == 4
-    assert all(f.tick < 4 for f in rn.audit)
+    assert all(f.tick < 4 for f in rn.audit_log())
     # Not idle (more work pending).
     assert not rn.is_idle()
 
@@ -107,7 +107,7 @@ def test_pause_at_resume_continues():
     rn.run_until_idle(max_ticks=20)
     # Now complete.
     assert rn.is_idle()
-    b_outputs = [f.output for f in rn.audit if f.node == "B"]
+    b_outputs = [f.output for f in rn.audit_log() if f.node == "B"]
     assert b_outputs == [1, 2, 3]
 
 
@@ -119,8 +119,8 @@ def test_to_json_from_json_roundtrip():
     rn.run_until_idle(max_ticks=20)
     s = rn.to_json()
     rn2 = Runner.from_json(s, g, r)
-    assert [(f.tick, f.node, f.output) for f in rn2.audit] == [
-        (f.tick, f.node, f.output) for f in rn.audit
+    assert [(f.tick, f.node, f.output) for f in rn2.audit_log()] == [
+        (f.tick, f.node, f.output) for f in rn.audit_log()
     ]
     assert rn2.tick_count == rn.tick_count
     assert rn2.is_idle() == rn.is_idle()
@@ -131,7 +131,7 @@ def test_audit_log_contains_edges_fired():
     g = _loop_graph(r)
     rn = Runner(g, r)
     rn.tick()  # seed fires
-    seed_firing = [f for f in rn.audit if f.node == "seed"][0]
+    seed_firing = [f for f in rn.audit_log() if f.node == "seed"][0]
     # seed's only out-edge is seed-->A (plain), so edges_fired has (A, None, True).
     assert ("A", None, True) in seed_firing.edges_fired
 

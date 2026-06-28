@@ -98,7 +98,21 @@ def test_unregistered_body_raises():
         parse("[A]-->B\nB.body: nope", registry=r)
 
 
-def test_input_from_non_producer_raises():
+def test_input_from_non_producer_warns_not_errors():
     r = _reg()
-    with pytest.raises(ParseError):
+    # Non-producer input must be upstream (A → B → C: A is upstream of C).
+    g = parse("[A]-->B\nB.body: b1\nB-->C\nC.inputs: A\nC.body: b1", registry=r)
+    assert "A" in g.nodes["C"].inputs
+
+
+def test_input_from_non_existent_node_raises():
+    r = _reg()
+    with pytest.raises(ParseError, match="not a node"):
         parse("[A]-->C\nC.inputs: Z\nC.body: b1", registry=r)
+
+
+def test_input_from_downstream_node_raises():
+    r = _reg()
+    # B reads X, but X is downstream of B (B→D→X). X fires after B.
+    with pytest.raises(ParseError, match="no directed path"):
+        parse("[A]-->B\nB.body: b1\nB-->D\nD.body: b1\nD-->X\nX.body: b1\nB.inputs: X", registry=r)

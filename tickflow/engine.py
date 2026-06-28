@@ -2,9 +2,9 @@
 
 Pure function
 -------------
-``tick`` is a pure function of ``(graph, marking_t, history, t, registry)``
+``tick`` is a pure function of ``(graph, marking_t, run_state, t, registry)``
 returning ``(marking_{t+1}, firings_t)``. The :class:`Runner` owns the only
-mutable state (marking + history + tick) and reconstructs the inputs each
+mutable state (marking + run_state + tick) and reconstructs the inputs each
 tick; there is no in-flight partial-firing state to snapshot. This is what
 makes ``Runner.snapshot`` a cheap JSON triple and ``restore`` a rewind.
 
@@ -18,13 +18,12 @@ a loop downstream's join). When a node fires, **all** its input slots reset to
 False (consumed). OR-join does not change slot bit-width; only the join
 predicate differs.
 
-History
--------
-``History.data`` is ``dict[node, list[(tick, value)]]``, append-only. Reads
-default to ``latest_before(t)``: the most recent fire of the producer with
-``tick < t`` -- the marking-consistent read (you cannot see a same-tick write
-by a peer). ``A[k]`` pins the producer's ``k``-th fire overall (1-based),
-independent of tick, for cross-iteration audit/replay.
+RunState
+--------
+:class:`tickflow.state.RunState` is the single source of truth for all
+state recording. It replaces the old scattered ``History``, ``audit`` list,
+and ``Marking.node_state``. Each tick, ``NodeState`` records are created
+and recorded into the ``RunState``.
 
 Bootstrap
 ---------
@@ -41,9 +40,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+import logging
+
 from .ir import Graph, Failure
 from .registry import Registry
+from .state import NodeState, RunState, _jsonable
 from .views import DictView, Resolved, Missing
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -55,84 +59,29 @@ class Marking:
     # self-loop producer to re-True its slot). Lets ``all([])==True`` be
     # gated on "hasn't fired yet" rather than firing every tick forever.
     armed_starts: set[str] = field(default_factory=set)
-    # Per-node mutable state (e.g. retry counters). Lives in the marking so it
-    # participates in snapshots/restore and is visible to guards. A node's body
-    # reads/writes its own slot via ``view.state``; writes take effect for the
-    # *next* marking (committed in Phase A along with slot consumption).
-    node_state: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def copy(self) -> "Marking":
         return Marking(
             slots=dict(self.slots),
             armed_starts=set(self.armed_starts),
-            node_state={n: dict(s) for n, s in self.node_state.items()},
         )
 
     def to_json(self) -> dict:
         return {
             "slots": {f"{dst}|{src}": v for (dst, src), v in self.slots.items()},
             "armed_starts": sorted(self.armed_starts),
-            "node_state": {n: dict(s) for n, s in self.node_state.items()},
         }
 
     @classmethod
     def from_json(cls, d: dict) -> "Marking":
         slots: dict[tuple[str, str], bool] = {}
-        for k, v in d["slots"].items():
+        for k, v in d.get("slots", {}).items():
             dst, src = k.split("|", 1)
             slots[(dst, src)] = bool(v)
         return cls(
             slots=slots,
             armed_starts=set(d.get("armed_starts", [])),
-            node_state={n: dict(s) for n, s in d.get("node_state", {}).items()},
         )
-
-
-class History:
-    """Append-only ``(tick, value)`` log per node, with policy-based reads."""
-
-    def __init__(self) -> None:
-        self.data: dict[str, list[tuple[int, Any]]] = {}
-
-    def append(self, node: str, tick: int, value: Any) -> None:
-        self.data.setdefault(node, []).append((tick, value))
-
-    def read(self, node: str, kind: str, k: int | None, t: int) -> Any:
-        entries = self.data.get(node, [])
-        if kind == "index":
-            if k is None or k < 1 or k > len(entries):
-                return Missing
-            return entries[k - 1][1]
-        # latest_before(t): most recent fire with tick < t.
-        last: tuple[int, Any] | None = None
-        for tk, v in entries:
-            if tk < t:
-                last = (tk, v)
-            else:
-                break  # entries are appended in tick order; safe to stop
-        return last[1] if last is not None else Missing
-
-    def firings_of(self, node: str) -> list[tuple[int, Any]]:
-        return list(self.data.get(node, []))
-
-    def to_json(self) -> dict:
-        # values may be arbitrary; Runner.snapshot coerces non-JSON-able ones
-        # to repr() (see runner._jsonable). Here we just store the raw lists.
-        return {n: [[t, v] for (t, v) in lst] for n, lst in self.data.items()}
-
-    @classmethod
-    def from_json(cls, d: dict) -> "History":
-        h = cls()
-        for n, lst in d.items():
-            h.data[n] = [(int(t), v) for (t, v) in lst]
-        return h
-
-    def truncate_after(self, tick: int) -> None:
-        """Rewind: drop all fires with ``tick > tick``. Used by Runner.restore."""
-        for n in list(self.data):
-            self.data[n] = [(t, v) for (t, v) in self.data[n] if t <= tick]
-            if not self.data[n]:
-                del self.data[n]
 
 
 def bootstrap(graph: Graph) -> Marking:
@@ -169,63 +118,23 @@ def _join_satisfied(graph: Graph, node: str, marking: Marking) -> bool:
     raise ValueError(f"unknown join {join!r} on {node!r}")
 
 
-def _resolve_inputs(graph: Graph, node: str, history: History, t: int, registry: Registry) -> dict[str, Resolved]:
+def _resolve_inputs(
+    graph: Graph, node: str, run_state: RunState, t: int, registry: Registry
+) -> dict[str, Resolved]:
     out: dict[str, Resolved] = {}
     for prod, policy in graph.nodes[node].inputs.items():
-        v = history.read(prod, policy.kind, policy.k, t)
+        v = run_state.resolve(prod, policy.kind, policy.k, t)
         out[prod] = Resolved(value=v, k=policy.k)
     return out
-
-
-@dataclass
-class Firing:
-    """Record of one node firing in one tick. Stored in Runner.audit and
-    serialised for snapshots/logs via :meth:`to_json`."""
-    tick: int
-    node: str
-    inputs: dict[str, Any]      # producer -> resolved value
-    output: Any                # what the body returned (may be a Failure)
-    edges_fired: list[tuple[str, str | None, bool]]
-    # edges_fired: (dst, guard_name_or_None, slot_value_written)
-    status: Literal["ok", "failed", "aborted"] = "ok"
-    error: str | None = None
-    # Snapshot of this node's state *after* the body ran (for audit/restore).
-    node_state: dict[str, Any] = field(default_factory=dict)
-
-    def to_json(self) -> dict:
-        from .runner import _jsonable  # late import: runner imports engine
-        return {
-            "tick": self.tick,
-            "node": self.node,
-            "inputs": {k: _jsonable(v) for k, v in self.inputs.items()},
-            "output": _jsonable(self.output),
-            "edges_fired": [[dst, g, v] for (dst, g, v) in self.edges_fired],
-            "status": self.status,
-            "error": self.error,
-            "node_state": _jsonable(self.node_state),
-        }
-
-    @classmethod
-    def from_json(cls, d: dict) -> "Firing":
-        return cls(
-            tick=d["tick"],
-            node=d["node"],
-            inputs=d["inputs"],
-            output=d["output"],
-            edges_fired=[(dst, g, v) for (dst, g, v) in d["edges_fired"]],
-            status=d.get("status", "ok"),
-            error=d.get("error"),
-            node_state=d.get("node_state", {}),
-        )
 
 
 def tick(
     graph: Graph,
     marking: Marking,
-    history: History,
+    run_state: RunState,
     t: int,
     registry: Registry,
-) -> tuple[Marking, list[Firing], bool]:
+) -> tuple[Marking, list[NodeState], bool]:
     """One synchronous tick. Returns ``(next_marking, firings, aborted)``.
 
     ``aborted`` is True iff some node returned an ``infrastructure`` Failure
@@ -240,22 +149,23 @@ def tick(
         return marking.copy(), [], False
 
     m_next = marking.copy()
-    firings: list[Firing] = []
+    firings: list[NodeState] = []
     aborted = False
 
-    # Phase A: fire each fireable node. Writes go to history and are visible
+    # Phase A: fire each fireable node. Writes go to run_state and are visible
     # to *resolutions and guards* in Phase B only via the SAME-tick entries
-    # we have just appended -- but reads use ``latest_before(t)`` (tick < t),
+    # we have just recorded -- but reads use ``latest_before(t)`` (tick < t),
     # so a peer cannot see this tick's write. A node's own body is resolved
     # before its write, so it too sees only prior ticks. This is the marking
     # step semantics.
     for node in fireable:
-        resolved = _resolve_inputs(graph, node, history, t, registry)
-        state_view = _NodeStateView(m_next.node_state.setdefault(node, {}))
+        resolved = _resolve_inputs(graph, node, run_state, t, registry)
+        # Initial mutable state: copy of the node's latest state from prior ticks.
+        initial_state = run_state.mutable_state(node)
+        state_view = _NodeStateView(initial_state)
         view = DictView(resolved, state_view, node)
         body = registry.get_body(graph.nodes[node].body)
         output = body(view)
-        history.append(node, t, output)
         is_fail = isinstance(output, Failure)
         status: Literal["ok", "failed", "aborted"] = "ok"
         error: str | None = None
@@ -266,22 +176,24 @@ def tick(
                 aborted = True
             else:
                 status = "failed"
-        firings.append(
-            Firing(
-                tick=t,
-                node=node,
-                inputs={k: v.value for k, v in resolved.items()},
-                output=output,
-                edges_fired=[],  # filled in Phase B
-                status=status,
-                error=error,
-                node_state=dict(m_next.node_state.get(node, {})),
-            )
+        ns = NodeState(
+            tick=t,
+            node=node,
+            inputs={k: v.value for k, v in resolved.items()},
+            output=output,
+            edges_fired=[],  # filled in Phase B
+            status=status,
+            error=error,
+            mutable_state=initial_state,
         )
-        # consume this node's input slots
+        firings.append(ns)
+        # Record into run_state: this commits the output for resolution and
+        # the mutable_state for downstream guard views.
+        run_state.record(ns)
+        # Consume this node's input slots.
         for p in graph.producers(node):
             m_next.slots[(node, p)] = False
-        # disarm if it was an armed start (one-shot)
+        # Disarm if it was an armed start (one-shot).
         m_next.armed_starts.discard(node)
 
     # Phase B: produce downstream slots. A guard on edge ``src--|g|-->dst``
@@ -293,6 +205,16 @@ def tick(
     # are not even consulted for failed nodes.
     for f in firings:
         failed = f.status in ("failed", "aborted")
+        if failed:
+            guarded = [e.guard for e in graph.out_edges(f.node) if e.guard is not None]
+            if guarded:
+                log.warning(
+                    "Node %r returned Failure (status=%s): guards %s on out-edges "
+                    "will NOT be evaluated — all out-edges write False. "
+                    "Consider using a guard on the output value instead of Failure "
+                    "for controllable routing.",
+                    f.node, f.status, guarded,
+                )
         for e in graph.out_edges(f.node):
             if failed:
                 v = False
@@ -300,7 +222,9 @@ def tick(
                 v = True
             else:
                 v = bool(registry.get_guard(e.guard)(
-                    _guard_view(graph, e.src, f.output, history, t, registry, m_next.node_state.get(e.src, {}))
+                    _guard_view(
+                        graph, e.src, f.output, run_state, t, registry,
+                    )
                 ))
             m_next.slots[(e.dst, e.src)] = v
             f.edges_fired.append((e.dst, e.guard, v))
@@ -309,14 +233,18 @@ def tick(
 
 
 def _guard_view(
-    graph: Graph, src: str, src_output: Any, history: History, t: int, registry: Registry,
-    src_state: dict[str, Any] | None = None,
+    graph: Graph,
+    src: str,
+    src_output: Any,
+    run_state: RunState,
+    t: int,
+    registry: Registry,
 ) -> DictView:
     """Build a view for guard evaluation where the firing node ``src``'s
     *current-tick* output is visible under its own name, and any other
     producer the guard may reference resolves to latest_before(t).
 
-    ``src_state`` is the firing node's own state dict (read-only for guards),
+    The firing node's own mutable state (just recorded in run_state) is
     exposed via ``view.state`` so a guard like "retry under max" can read
     ``view.state["attempts"]``.
     """
@@ -326,16 +254,17 @@ def _guard_view(
     for name in graph.nodes:
         if name == src:
             continue
-        v = history.read(name, "latest", None, t)
+        v = run_state.resolve(name, "latest", None, t)
         resolved[name] = Resolved(value=v, k=None)
-    state_view = _NodeStateView(src_state or {})
+    src_state = run_state.mutable_state(src)
+    state_view = _NodeStateView(src_state)
     return DictView(resolved, state_view, src)
 
 
 class _NodeStateView:
-    """A thin read/write proxy over a node's state dict. Bodies write through
-    ``view.state["k"] = v``; the underlying dict is the marking's slot, so
-    writes land in the next marking (committed in Phase A). Guards receive a
+    """A thin read/write proxy over a node's mutable state dict. Bodies write
+    through ``view.state["k"] = v``; the underlying dict is the per-firing
+    state that will be captured in the NodeState record. Guards receive a
     read-only view (writes would be ignored/discarded)."""
 
     __slots__ = ("_d",)

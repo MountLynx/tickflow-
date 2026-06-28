@@ -61,12 +61,12 @@ def test_rollback_to_checkpoint_restores_state():
     rn.run_until_idle(max_ticks=20, pause_at={3})
     rn.checkpoint("cp3")
     rn.run_until_idle(max_ticks=20)  # finish
-    final_audit = [(f.tick, f.node, f.output) for f in rn.audit]
+    final_audit = [(f.tick, f.node, f.output) for f in rn.audit_log()]
     # Rollback to cp3 and replay.
     rn.rollback_to("cp3")
     assert rn.tick_count == 3
     rn.run_until_idle(max_ticks=20)
-    replayed = [(f.tick, f.node, f.output) for f in rn.audit]
+    replayed = [(f.tick, f.node, f.output) for f in rn.audit_log()]
     assert replayed == final_audit
 
 
@@ -147,7 +147,7 @@ def test_set_registry_swaps_body():
     # With doubling: B outputs 0*2=0, then A=0, B=0*2=0 ... infinite loop until
     # terminal. We just verify the registry took effect: B's first fire after
     # swap used the new body.
-    b_outputs = [f.output for f in rn.audit if f.node == "B"]
+    b_outputs = [f.output for f in rn.audit_log() if f.node == "B"]
     # At least one B fired after the swap with doubled logic.
     assert 0 in b_outputs or len(b_outputs) > 0
 
@@ -162,7 +162,7 @@ def test_set_registry_preserves_state():
     snap_after = rn.snapshot()
     assert snap_before["tick"] == snap_after["tick"]
     assert snap_before["marking"] == snap_after["marking"]
-    assert snap_before["history"] == snap_after["history"]
+    assert snap_before["run_state"]["edges"] == snap_after["run_state"]["edges"]
 
 
 def test_set_registry_missing_body_raises():

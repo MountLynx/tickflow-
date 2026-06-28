@@ -2,26 +2,25 @@
 
 A small Petri-style workflow control framework for building short, auditable,
 reversible flows. You describe the graph in a mermaid-like syntax; the engine
-runs it as synchronous Petri-net *steps* over a boolean slot marking, with an
-append-only history that makes snapshots, pause, rewind, and replay cheap.
+runs it as synchronous Petri-net *steps* over a boolean slot marking, with
+all runtime state centralized in `RunState` — making snapshots, pause, rewind,
+and replay cheap.
 
 > Is this a state machine? No — it's a **Petri net** (specifically a marked
 > graph with AND/OR joins). A finite state machine is the degenerate case
-> where exactly one token is live in the whole net at any time. `flow`
+> where exactly one token is live in the whole net at any time. `tickflow`
 > supports multiple concurrent starts, AND-joins (wait for all upstream),
 > OR-joins (fire on any upstream), and cycles — none of which plain FSMs
 > express natively. See [Design notes](#design-notes).
 
-
-
 ## Quick start
 
 ```bash
-python -m flow run examples/counter_loop.txt -b examples/counter_loop_beh.py
+python -m tickflow run examples/counter_loop.txt -b examples/counter_loop_beh.py
 ```
 
 The graph file declares **structure only**; a Python "behaviours" file
-registers the actual body/guard callables on `flow.registry`.
+registers the actual body/guard callables on `tickflow.registry`.
 
 ### Graph syntax
 
@@ -43,14 +42,16 @@ C.join: OR               # override join (AND is the default)
   previous iteration can never leak into a loop).
 - `node.inputs:` and `node.body:` lines bind behaviour. Both are optional
   (default body = identity/echo; default inputs = every producer, each with
-  `latest_before`).
+  `latest_before`). `inputs` may reference non-producer nodes (e.g. `A[k]`
+  to pin A's k-th fire) as long as the referenced node is **upstream** in
+  the graph (has a directed path to the consumer).
 - `#` starts a comment.
 
 ### Behaviours file
 
 ```python
-from flow import registry
-from flow.views import Missing
+from tickflow import registry
+from tickflow.views import Missing
 
 @registry.body("incr")
 def incr(v):
@@ -66,6 +67,68 @@ declared producer per the node's input policy. `v.A.value` is the bare value;
 `v.A.k` is the fire index used (or `None` for `latest_before`). A producer
 with no qualifying fire yet yields the `Missing` sentinel (falsy).
 
+## Architecture
+
+### RunState — single source of truth
+
+All runtime state lives in `RunState`, organized in three internal layers
+with distinct responsibilities:
+
+```
+RunState
+├── _edges   dict[node, list[(tick, output)]]    always maintained, for resolve()
+├── _state   dict[node, dict[str, Any]]          always maintained, O(1) mutable state
+└── _records list[NodeState]                     only when keep_records=True, full audit trail
+```
+
+- **`_edges`** — fast-lookup index for `resolve()` (input resolution during
+  tick execution). Replaces the old `History` class.
+- **`_state`** — current mutable state per node (what bodies write via
+  `view.state`). Always maintained, O(1) access. Replaces the old
+  `Marking.node_state`.
+- **`_records`** — full `NodeState` records (inputs, output, edges_fired,
+  status, error, mutable_state). Controlled by `keep_records`.
+
+Derived artefacts are extracted from these three layers:
+
+| Artefact | Source | Controlled by |
+|----------|--------|---------------|
+| `resolve()` — input resolution | `_edges` | always available |
+| `mutable_state()` — node state | `_state` | always available |
+| `firings_of()` — output history | `_edges` | always available |
+| `audit()` — full audit log | `_records` | `keep_records` |
+| `to_snapshot_data()` — snapshot | all three | `records` key only when `keep_records=True` |
+
+### NodeState — one firing, all data
+
+```python
+@dataclass
+class NodeState:
+    tick: int                          # which tick
+    node: str                          # which node
+    inputs: dict[str, Any]             # resolved input values
+    output: Any                        # body return value
+    edges_fired: list[tuple[...]]      # downstream edge results (filled in Phase B)
+    status: "ok" | "failed" | "aborted"
+    error: str | None
+    mutable_state: dict[str, Any]      # node state after body ran
+```
+
+This is the **single source of truth** for everything that happened to a node
+at a given tick. It replaces the old `Firing` class (same fields, unified
+ownership).
+
+### Memory-saving mode
+
+```python
+rn = Runner(graph, registry, keep_records=False)
+```
+
+When `keep_records=False`, `_records` is not populated — saving memory — but
+`_edges` and `_state` are still maintained. Input resolution and node mutable
+state work correctly regardless of this switch. The snapshot omits the
+`"records"` key. Backend persistence (firings, snapshots) is unaffected.
+
 ## Semantics
 
 ### The model
@@ -73,15 +136,13 @@ with no qualifying fire yet yields the `Missing` sentinel (falsy).
 The engine is a **pure function**:
 
 ```
-tick: (marking_t, history_{<t}) -> (marking_{t+1}, firings_t)
+tick: (marking_t, run_state, t) -> (marking_{t+1}, firings_t)
 ```
 
-Three quantities determine everything:
-
+Only two mutable state containers exist:
 - **marking** — `dict[(dst, src), bool]`, one boolean *slot* per incoming
   edge, plus a set of *armed* start nodes (one-shot).
-- **history** — `dict[node, list[(tick, value)]]`, append-only.
-- **tick** — the current tick index.
+- **run_state** — `RunState` instance (all history, state, audit).
 
 There is no hidden in-flight state. That's what makes snapshots cheap.
 
@@ -93,7 +154,7 @@ There is no hidden in-flight state. That's what makes snapshots cheap.
      for OR.
 2. Each fireable node fires concurrently: its body reads inputs
    (`latest_before(t)` — strictly prior ticks, so peers can't see each
-   other's same-tick writes), its output is appended to history, and its
+   other's same-tick writes), its output is recorded in `RunState`, and its
    input slots are consumed (reset to `False`).
 3. After all fires, each fired node's out-edges write into downstream slots:
    plain edges write `True`, guarded edges write `guard(view)`.
@@ -108,6 +169,10 @@ There is no hidden in-flight state. That's what makes snapshots cheap.
 
 A producer with no qualifying fire yields `Missing` (falsy); bodies are
 expected to handle it.
+
+Inputs may reference nodes that are not direct producers (no edge into the
+consumer), e.g. `C.inputs: A[1]` where A is upstream of C via a longer path.
+This is valid as long as A has a directed path to C (so A fires before C).
 
 ### Joins
 
@@ -129,7 +194,7 @@ synchronous step semantics make the "≥1 slot" predicate decidable — no
 "will more tokens arrive?" question (the open Petri-net OR-join problem).
 
 ```python
-from flow import parse, check, promote
+from tickflow import parse, check, promote
 g = parse(text, registry=r)
 for s in check(g):       # list[DeadlockSuggestion]
     promote(s, g)        # flips s.node.join to "OR"
@@ -137,6 +202,20 @@ for s in check(g):       # list[DeadlockSuggestion]
 
 Constructing a `Runner` with unresolved suggestions raises `DeadlockError`
 (no silent deadlocks).
+
+### Static warnings (parse time)
+
+The parser emits warnings for common pitfalls:
+
+| Warning | Condition |
+|---------|-----------|
+| Consumer reads from bodyless producer | `C.inputs` references a node with no body — C will receive `None` |
+| Non-producer input | `C.inputs` references a node not connected by an edge — resolves via history, not token flow |
+| Unguarded cycle | A cycle has no guarded edge — will loop forever |
+
+At runtime, the engine warns when a node returning `Failure` has guarded
+out-edges (guards are never evaluated for failed nodes — all out-edges
+write `False`).
 
 ## Snapshot, pause, rewind
 
@@ -149,17 +228,20 @@ rn.restore(snap)                                  # rewind to tick 5
 rn.run_until_idle(max_ticks=100)                  # replay (identical if bodies pure)
 ```
 
-- **`snapshot()`** returns `{"tick", "marking", "history", "status", "cancel_reason"}` — pure
-  JSON. `tick` is the *next* tick to fire. `marking` now includes `node_state`.
-- **`restore(snap)`** rewinds: sets tick/marking/history/status from `snap` and
-  truncates the audit log to ticks `< snap["tick"]`. A restored terminal status
-  (ABORTED/CANCELLED/FAILED) is reset to IDLE so the run can resume.
+- **`snapshot()`** returns `{"tick", "marking", "run_state", "status",
+  "cancel_reason", "fireable"}` — pure JSON. `run_state` contains `edges`
+  (output index), `state` (mutable state per node), and `records` (full audit,
+  only when `keep_records=True`).
+- **`restore(snap)`** rewinds: sets tick/marking/run_state/status from `snap`.
+  RunState records with `tick >= snap["tick"]` are dropped. A restored
+  terminal status (ABORTED/CANCELLED/FAILED) is reset to IDLE so the run can
+  resume.
 - **`pause_at={n}`** stops at the tick boundary before tick `n` — no
   half-fired state to save.
 - **Branching / what-if**: `copy.deepcopy(snap)` and `restore` into separate
   Runners. The library doesn't maintain a timeline forest.
-- **`to_json()` / `from_json()`** serialize the full state (snapshot + audit
-  log). The graph and registry are *not* stored — supply them on reload.
+- **`to_json()` / `from_json()`** serialize the full state as a single JSON
+  object. The graph and registry are *not* stored — supply them on reload.
 
 **Body purity**: bodies should be pure functions of their input view (state
 writes aside). If a body is non-pure, restore-then-replay may diverge from the
@@ -172,7 +254,7 @@ original run (the audit log still records what originally happened).
 A body may return `Failure(error, type=...)` instead of a normal value:
 
 ```python
-from flow import Failure
+from tickflow import Failure
 
 @registry.body("call_llm")
 def call_llm(v):
@@ -190,15 +272,20 @@ def call_llm(v):
 - **`type="infrastructure"`**: an unrecoverable failure. Out-edges write
   `False` **and** the runner enters `ABORTED`, halting all further ticks.
 
-A `Failure` is still written to history and recorded in the audit log with
-`Firing.status` (`"failed"` / `"aborted"`) and `Firing.error`.
+A `Failure` is still recorded in `RunState` and the audit log with
+`NodeState.status` (`"failed"` / `"aborted"`) and `NodeState.error`.
+
+> **Important**: a failed node writes `False` to **all** out-edges —
+> guarded edges are not evaluated. To implement controllable routing
+> (e.g. retry on failure), have the body return a result dict and let the
+> guard inspect the output value, rather than returning `Failure`.
 
 ### RunStatus
 
-`Runner.status` is a `RunStatus` enum replacing the old `_idle` flag:
+`Runner.status` is a `RunStatus` enum:
 
 | Status | Meaning |
-|---|---|
+|--------|---------|
 | `IDLE` | quiescent (nothing fired last tick, or never started) |
 | `RUNNING` | a tick fired (transient; becomes IDLE/terminal next) |
 | `ABORTED` | an infrastructure `Failure` occurred; halted |
@@ -214,49 +301,51 @@ rn.reset()                         # clear a non-RUNNING status back to IDLE
 
 ### Node state (`view.state`)
 
-Each node has a mutable state dict that lives in the marking (so it
-participates in snapshots/restore) and is visible to guards. Bodies read/write
-their own state; guards receive a read-only view:
+Each node has a mutable state dict managed by `RunState` (so it participates
+in snapshots/restore) and is visible to guards. Bodies read/write their own
+state; guards receive a read-only view:
 
 ```python
 @registry.body("retryable")
 def retryable(v):
     v.state["attempts"] = v.state.get("attempts", 0) + 1
-    return do_work(v.A.value)
+    return {"ok": v.state["attempts"] >= 3, "attempt": v.state["attempts"]}
 
-@registry.guard("under_max")
-def under_max(v):
-    return v.state.get("attempts", 0) < 3
+@registry.guard("should_retry")
+def should_retry(v):
+    out = v.B.value
+    return isinstance(out, dict) and not out.get("ok") and v.state.get("attempts", 0) < 3
 ```
 
-This is how a compliance-retry self-loop is expressed: the body increments
-`attempts`, the guard stops looping once the cap is reached.
+This is how a retry self-loop is expressed: the body tracks `attempts` in
+state, returns a result dict, and the guard checks both the result and the
+state to decide whether to loop.
 
 ## Hooks (the observer seam)
 
-`on_fire` / `on_tick_end` are the single seam between flow and the outside
-world (events, record stores, progress). They fire on every node fire / tick
-end. Hook exceptions are logged and swallowed so a misbehaving observer can't
-corrupt the run.
+`on_fire` / `on_tick_end` / `on_tick_start` are the single seam between
+tickflow and the outside world (events, record stores, progress). They fire
+on every node fire / tick end / tick start. Hook exceptions are logged and
+swallowed so a misbehaving observer can't corrupt the run.
 
 ```python
-rn.on_fire(lambda firing: event_bus.emit_task_completed(...))
-rn.on_tick_end(lambda tick, firings: snapshot_store.save(tick, rn.snapshot()))
+rn.on_fire(lambda ns: event_bus.emit(ns.node, ns.output))
+rn.on_tick_start(lambda tick, fireable: ui.highlight(fireable))
+rn.on_tick_end(lambda tick, firings: db.save(tick, rn.snapshot()))
 ```
 
 The `AsyncRunner` accepts async hooks (`async def`).
 
 ## Persistence backend
 
-A `Runner` constructed with `backend=...` and `session_id=...` persists, at
-the end of every tick: each `Firing` (the process record) and a full snapshot
-at the new tick index. This realizes the 重构.md design: "快照粒度一个 tick"
-+ "整个进程进行过程记录".
+A `Runner` constructed with `backend=...` and `session_id=...` persists,
+at the end of every tick: each `NodeState` (the process record) and a full
+snapshot at the new tick index.
 
 ```python
-from flow import JsonBackend
+from tickflow import JsonBackend
 
-be = JsonBackend(".flow/sessions")
+be = JsonBackend("tickflow/sessions")
 rn = Runner(graph, registry, backend=be, session_id="sess-1")
 rn.run_until_idle(max_ticks=100)
 
@@ -271,8 +360,9 @@ rn2.restore(snap)
   `list_checkpoints` / `load_checkpoint`.
 - **`JsonBackend(storage_dir)`**: one dir per session, `tick_<N>.json` +
   `firings.jsonl` + `checkpoints.json`. Default; human-inspectable.
+- **`SqliteBackend(db_path)`**: single SQLite file with `snapshots` /
+  `firings` / `checkpoints` tables. Better for high tick-throughput.
 - **`NullBackend`**: in-memory, for tests.
-- `SqliteBackend` is planned (not in v1) for high tick-throughput.
 
 ### Named checkpoints
 
@@ -284,18 +374,30 @@ rn.list_checkpoints()              # [(label, tick), ...]
 rn.rollback_to("after_prep")       # restore to that checkpoint
 ```
 
-This replaces the old `SnapshotManager`'s label/list/rollback_to.
+### Graph remap (hot-swap graph structure)
+
+After a rollback, you can replace the graph structure and/or registry before
+resuming:
+
+```python
+rn.rollback_to("safe_point")
+rn.remap_graph(new_graph, registry=new_registry)
+rn.run_until_idle(max_ticks=100)
+```
+
+Slots that exist in both graphs keep their current value; new slots start
+`False`; removed slots are discarded. `RunState` is filtered to keep only
+nodes present in the new graph.
 
 ## AsyncRunner
 
 For graphs whose bodies do IO (LLM calls, HTTP, DB), use `AsyncRunner`.
 Bodies and guards may be `async def`; fireable nodes fire **concurrently**
 within a tick via `asyncio.gather`. Semantics are identical to the sync
-`Runner` (marking-step concurrency, Failure propagation, node_state, hooks,
-persistence, checkpoints).
+`Runner`.
 
 ```python
-from flow.async_runner import AsyncRunner
+from tickflow.async_runner import AsyncRunner
 
 @registry.body("harness")
 async def harness(v):
@@ -305,13 +407,10 @@ rn = AsyncRunner(graph, registry, backend=be, session_id="sess-1")
 await rn.run_until_idle(max_ticks=100)
 ```
 
-Sync and async bodies/guards may be mixed in the same graph.
+Sync and async bodies/guards may be mixed in the same graph. `Runner` and
+`AsyncRunner` share all state-management logic via `_BaseRunner`.
 
 ## Visualization & front-end integration
-
-tickflow exposes everything a front-end needs to render and drive a live
-process graph: static structure, per-tick "what's about to fire", per-node
-state, and a hook timeline.
 
 ### Static graph export
 
@@ -332,117 +431,100 @@ rn.node_states()      # {node: {state dict}} — read-only copy (e.g. attempts)
 ```
 
 `fireable()` is computed identically to the engine's internal check, so it
-exactly predicts the next `tick()`. `node_states()` returns a deep copy so
-mutating it doesn't affect the run.
+exactly predicts the next `tick()`. `node_states()` returns copies from
+`RunState.all_mutable_states()`.
 
 ### Tick lifecycle hooks
 
 ```
 on_tick_start(tick, fireable[])   # before any node fires this tick
   → engine runs (body/guard execute)
-  → on_fire(firing) × N           # after each node fires
+  → on_fire(ns) × N               # after each node fires (receives NodeState)
 on_tick_end(tick, firings[])      # after all fires committed
 ```
 
-```python
-rn.on_tick_start(lambda tick, fireable: ws.broadcast({"tick": tick, "fireable": fireable}))
-rn.on_fire(lambda firing: ws.broadcast({"fired": firing.node, "status": firing.status}))
-rn.on_tick_end(lambda tick, firings: ws.broadcast({"tick_done": tick}))
-```
-
-AsyncRunner accepts sync or `async def` hooks. Hook exceptions are logged and
-swallowed — a misbehaving observer can't corrupt the run.
-
-### Snapshot carries fireable
+### Audit log
 
 ```python
-snap = rn.snapshot()
-# snap["fireable"] == rn.fireable()  — front-end reads one dict and gets
-#                                       both state and "what's next"
+for ns in rn.audit_log():          # list[NodeState]
+    print(f"t{ns.tick} {ns.node}: {ns.inputs} → {ns.output} [{ns.status}]")
+
+rn.audit_json()                    # JSON string
 ```
 
-`fireable` is derived from the marking but persisted in the snapshot so a
-front-end reading a saved snapshot (e.g. via backend) gets the preview without
-recomputing. On `restore()`, `fireable` is not read back — the restored
-marking is authoritative, so `rn.fireable()` is correct automatically.
-
-### Disabling in-memory audit
-
-For embedded / front-end-push scenarios where you don't need the in-memory
-audit log (you're streaming via hooks instead), turn it off to save memory:
-
-```python
-rn = Runner(graph, registry, enable_audit=False)
-```
-
-- `self.audit` stays empty; `tick()` doesn't accumulate.
-- **firings.jsonl backend persistence is unaffected** — `Backend.save_firing`
-  still runs every tick, so the process record survives for crash recovery.
-- `to_json()` emits `"audit": []`.
-
-### Where streaming LLM tokens go
-
-tickflow deliberately does **not** handle LLM token streaming — that's a
-call-level concern belonging to the harness/EventBus layer, not the flow
-engine. tickflow's hooks give the front-end coarse anchors ("node X is
-firing", "node X done with status ok"), while token chunks flow through a
-separate channel (e.g. ModularHarness's EventBus `llm_token` events). This
-keeps tickflow's audit/snapshot small (node-level, not token-level).
+Each `NodeState` record includes `inputs` (what the body read), `output`
+(what it returned), `edges_fired` (how tokens propagated), `status`, `error`,
+and `mutable_state` (node state snapshot after the body ran).
 
 ## CLI
 
 ```
-python -m flow run     graph.txt -b beh.py [--max-ticks N] [--pause-at T ...]
-python -m flow step    graph.txt -b beh.py [--from-snapshot snap.json] --ticks N
-python -m flow snapshot graph.txt -b beh.py --out snap.json [--max-ticks N]
-python -m flow audit   run.json
+python -m tickflow run      graph.txt -b beh.py [--max-ticks N] [--pause-at T ...]
+python -m tickflow step     graph.txt -b beh.py [--from-snapshot snap.json] --ticks N
+python -m tickflow snapshot graph.txt -b beh.py --out snap.json [--max-ticks N]
+python -m tickflow audit    run.json
 ```
 
-Deadlock suggestions are presented interactively on `run`/`step`. Use
-`--auto-promote` to accept all, or `--no-promote` to reject (and error).
+Deadlock suggestions: use `--auto-promote` to accept all, or `--no-promote`
+to reject (and error). In non-interactive environments (CI, scripts), the
+CLI defaults to erroring out with guidance — no hanging on stdin.
 
 ## Examples
 
-- `examples/counter_loop.txt` — a counter that loops while < 3, then stops.
-  Shows cycles, a terminating guard, and an explicit OR-join on the loop
-  member.
-- `examples/xor_merge.txt` — an XOR branch (B picks A or D) feeding a Merge.
-  The checker flags the AND-join deadlock and prompts to promote Merge to
-  OR-join.
+| Example | Description |
+|---------|-------------|
+| `counter_loop` | Counter that loops while < 3, then stops. Cycles + terminating guard + OR-join. |
+| `xor_merge` | XOR branch feeding a Merge. Checker flags AND-join deadlock → promote to OR. |
+| `retry_loop` | Retry with `view.state` counter. Guard reads both output and state. |
+| `fan_out` | Parallel workers + AND-join merge. Three branches fire concurrently. |
+| `pipeline` | Three-stage pipe with `A[k]` index policy pinning A's first fire. |
+| `state_machine` | Approval workflow: submit → review → approve/reject → done. XOR-splitter. |
+| `checkpoint_restore` | Full workflow: checkpoint → rollback → remap → resume. Python script. |
+| `keep_records_false` | Memory-saving mode demo: no audit, but state persists. Python script. |
 
 ## Design notes
 
 **Why Petri net, not FSM?** The original design — a boolean slot per
 incoming edge, AND over slots to fire, consume-on-fire, produce-into-
 downstream — is exactly a marked graph (a Petri net subclass). An FSM is the
-special case with exactly one live token; `flow` allows multiple concurrent
-starts and AND/OR joins, which FSMs don't express natively. Cycles (loops)
-are natural in Petri nets and forbidden in DAG schedulers (Airflow etc.).
+special case with exactly one live token; `tickflow` allows multiple
+concurrent starts and AND/OR joins, which FSMs don't express natively.
+Cycles (loops) are natural in Petri nets and forbidden in DAG schedulers.
 
 **Why synchronous steps?** It makes the OR-join decidable (no "could more
-tokens arrive?" question) and makes snapshots a trivial JSON triple —
-there's no in-flight partial firing to save, so pause lands cleanly on tick
+tokens arrive?" question) and makes snapshots a trivial JSON dict — there's
+no in-flight partial firing to save, so pause lands cleanly on tick
 boundaries.
 
-**What's deliberately out of scope (v1):** inclusive/XOR-join syntax beyond
-OR; per-node persistent state (a `node_state` field is reserved);
-distributed/multi-worker scheduling; graph→mermaid reverse rendering; a
-built-in timeline forest (use `deepcopy`).
+**Why three-layer RunState?** The old design had `History`, `audit` list, and
+`Marking.node_state` as three separate, partially redundant structures. The
+three-layer `RunState` (`_edges` + `_state` + `_records`) unifies them under
+one owner with clear responsibilities. `_edges` and `_state` are always
+maintained (engine needs them); `_records` (detailed audit) is gated on
+`keep_records`.
+
+**What's deliberately out of scope:** inclusive/XOR-join syntax beyond OR;
+distributed/multi-worker scheduling; a built-in timeline forest (use
+`deepcopy`); LLM token streaming (that's a harness/EventBus concern — tickflow
+records at node granularity).
 
 ## Project layout
 
 ```
-flow/
-  ir.py        Node, Edge, Graph, InputPolicy dataclasses
-  parser.py    mermaid-like text -> Graph
-  checker.py   static deadlock detection + OR-join promotion
-  engine.py    Marking, History, tick (pure), Firing
-  runner.py    Runner: tick/run/snapshot/restore/audit/pause
-  registry.py  body/guard registration
-  views.py     DictView + Resolved + Missing
-  cli.py       python -m flow ...
-tests/         42 tests: parser, checker, engine, loop, snapshot, audit
-examples/      counter_loop, xor_merge (+ behaviours)
+tickflow/
+  ir.py           Node, Edge, Graph, InputPolicy, Failure
+  parser.py       mermaid-like text → Graph (with static warnings)
+  checker.py      deadlock detection, OR-join promotion, unguarded cycle detection
+  state.py        NodeState, RunState — single source of truth for all runtime data
+  engine.py       Marking, tick (pure function), join logic
+  runner.py       Runner, _BaseRunner (shared sync/async logic)
+  async_runner.py AsyncRunner (async bodies, concurrent firing)
+  registry.py     body/guard registration
+  views.py        DictView, Resolved, Missing
+  persistence.py  Backend protocol, JsonBackend, SqliteBackend, NullBackend
+  cli.py          python -m tickflow ...
+tests/            17 files, 163 tests
+examples/         8 examples (6 graph + 2 Python scripts)
 ```
 
 ## Running the tests

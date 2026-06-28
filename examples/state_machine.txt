@@ -1,0 +1,18 @@
+# Simple approval state machine: submit → review → approve/reject.
+# XOR-splitter at review routes to approve or reject based on guard.
+# The checker will flag the AND-join deadlock at 'done' — use --auto-promote.
+#
+# Run:
+#   python -m tickflow run examples/state_machine.txt -b examples/state_machine_beh.py --auto-promote
+
+[start]-->submit
+submit.body: submit_form
+submit-->review
+review.body: review_form
+review--|approved|-->approve
+review--|rejected|-->reject
+approve.body: approve_action
+reject.body: reject_action
+approve-->done
+reject-->done
+done.body: finalize

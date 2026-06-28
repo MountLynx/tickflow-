@@ -115,6 +115,6 @@ def test_fireable_after_cancel_reflects_marking():
     # fireable() is a pure marking query; cancel doesn't clear slots.
     assert "A" in rn.fireable()
     # But tick() is a no-op (terminal), so the run is halted.
-    before = len(rn.audit)
+    before = len(rn.audit_log())
     rn.tick()
-    assert len(rn.audit) == before
+    assert len(rn.audit_log()) == before
