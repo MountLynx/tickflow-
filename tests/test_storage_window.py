@@ -274,6 +274,14 @@ def test_audit_from_backend_full_and_dedup(tmp_path):
     assert [(ns.tick, ns.node, ns.output) for ns in audit2] == [
         (1, "A", "a1"), (1, "B", "b1"), (2, "A", "a2"),
     ]
+    # ceiling：超 ceiling 的行（如同 session 的上一轮运行数据）被排除
+    be.save_firings("s1", [
+        {"tick": 99, "node": "A", "output": "stale"},
+    ])
+    audit3 = rs.audit()
+    assert [(ns.tick, ns.node, ns.output) for ns in audit3] == [
+        (1, "A", "a1"), (1, "B", "b1"), (2, "A", "a2"),
+    ]
 
 
 def test_audit_empty_when_keep_records_false(tmp_path):

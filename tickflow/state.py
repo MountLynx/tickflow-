@@ -128,9 +128,9 @@ class RunState:
         ``_edges`` and ``_state`` are still maintained — so input resolution
         and node mutable state work correctly regardless of this switch.
     backend, session_id, persistent
-        Cold-storage wiring: when a backend is attached (and ``persistent``
-        is True) the full firing history is persisted there and the in-memory
-        audit is not maintained.
+        Cold-storage wiring: when a backend and session_id are attached every
+        firing is persisted there (``persistent`` only gates whether the
+        on-disk history is the source for audit/firings_of queries).
     """
 
     def __init__(
@@ -226,11 +226,7 @@ class RunState:
                 if k >= lo:
                     return entries[k - lo][1]
             # Older fires: cold query, or explicit degradation.
-            if (
-                self._persistent
-                and self._backend is not None
-                and self._session_id is not None
-            ):
+            if self._persisted:
                 v = self._backend.firing_at(self._session_id, node, k)
                 return Missing if v is None else v
             return Missing
@@ -248,16 +244,13 @@ class RunState:
     # ------------------------------------------------------------------
 
     def firings_of(self, node: str) -> list[tuple[int, Any]]:
-        """Return ``[(tick, output), ...]`` for *node*, in tick order.
+        """Return ``[(tick, output), ...]`` for *node*, in append order (which
+        equals tick order for a real run — a node fires at most once per tick).
 
         Persistent backend: full history from the database.  NullBackend
         path: the in-memory window (≤ 2 entries) — D7 degradation.
         """
-        if (
-            self._persistent
-            and self._backend is not None
-            and self._session_id is not None
-        ):
+        if self._persisted:
             return self._backend.firings_of(self._session_id, node)
         return list(self._edges.get(node, []))
 
@@ -265,6 +258,15 @@ class RunState:
         """The most recent output of *node*, or None if never fired."""
         entries = self._edges.get(node, [])
         return entries[-1][1] if entries else None
+
+    @property
+    def _persisted(self) -> bool:
+        """True when a persistent backend is attached and queryable."""
+        return (
+            self._persistent
+            and self._backend is not None
+            and self._session_id is not None
+        )
 
     # ------------------------------------------------------------------
     # Audit log (from _records)
@@ -277,21 +279,19 @@ class RunState:
         this RunState's audit ceiling, deduplicated by ``(tick, node)`` so a
         restore-then-replay does not double-count replayed firings).  Memory
         path (NullBackend): ``_records`` — unchanged behaviour.
+
+        The auto-flush is best-effort (a failed flush drops the tail batch),
+        so the returned log may miss the most recent unpersisted firings.
         """
         if not self._keep_records:
             return []
-        if (
-            self._persistent
-            and self._backend is not None
-            and self._session_id is not None
-        ):
-            try:
-                self.flush_firings()
-            except Exception:
-                log.exception("flush_firings failed; swallowed")
+        if self._persisted:
+            self.flush_firings()
             out: list[NodeState] = []
             seen: set[tuple[int, str]] = set()
             for d in self._backend.list_firings(self._session_id):
+                if "tick" not in d or "node" not in d:
+                    continue          # malformed row — skip
                 if d.get("tick", 0) > self._audit_ceiling:
                     continue
                 key = (d["tick"], d["node"])
