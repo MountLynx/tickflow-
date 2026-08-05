@@ -206,17 +206,33 @@ class RunState:
     def resolve(self, node: str, kind: str, k: int | None, t: int) -> Any:
         """Resolve a producer's output for a consumer firing at tick *t*.
 
-        ``kind`` is ``"latest"`` (most recent fire with tick < t)
-        or ``"index"`` (the k-th fire overall, 1-based).
+        ``kind`` is ``"latest"`` (most recent fire with tick < t — memory
+        window, O(1)) or ``"index"`` (the k-th fire overall, 1-based —
+        memory window first, then the backend for older fires; window-external
+        reads degrade to ``Missing`` on the NullBackend path, D2/D7).
         """
-        entries = self._edges.get(node, [])
         if kind == "index":
-            if k is None or k < 1 or k > len(entries):
-                return Missing
-            return entries[k - 1][1]
-        # latest_before(t)
+            # Window first: the last two fires resolve from memory (O(1)),
+            # including the current tick's just-recorded fire — preserving the
+            # same-tick visibility of the old full-history behaviour.
+            entries = self._edges.get(node, [])
+            count = self._fire_counts.get(node, 0)
+            if entries and k is not None and 1 <= k <= count:
+                lo = count - len(entries) + 1
+                if k >= lo:
+                    return entries[k - lo][1]
+            # Older fires: cold query, or explicit degradation.
+            if (
+                self._persistent
+                and self._backend is not None
+                and self._session_id is not None
+            ):
+                v = self._backend.firing_at(self._session_id, node, k or 0)
+                return Missing if v is None else v
+            return Missing
+        # latest_before(t) — window scan (≤ 2 entries, O(1))
         last: tuple[int, Any] | None = None
-        for tk, v in entries:
+        for tk, v in self._edges.get(node, []):
             if tk < t:
                 last = (tk, v)
             else:

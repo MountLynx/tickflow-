@@ -169,3 +169,55 @@ def test_pending_queue_batches_per_tick_and_flushes():
     assert len(rs._pending) == 1              # 队列只剩第二批
     rs.flush_firings()                        # 尾批显式 flush
     assert [f["node"] for f in be.list_firings("s1")] == ["A", "B", "A"]
+
+
+# --------------------------------------------------------------------------
+# A3: resolve() dispatch
+# --------------------------------------------------------------------------
+
+def _index_graph(r: Registry, k: str = "A[3]"):
+    @r.body("track_k")
+    def _track(v):
+        return v.A.value
+
+    return parse(
+        "[seed]-->A\nseed.body: seed_zero\nA.body: passthru\nA.join: OR\n"
+        "A-->B\nB.body: incr\nB--|cont_ltN|-->A\n"
+        "A-->C\nC.inputs: %s\nC.body: track_k" % k,
+        registry=r,
+    )
+
+
+def test_index_resolves_from_backend():
+    r = _reg(limit=5)              # A fires 5 times (values 0..4)
+    rn = Runner(_index_graph(r), r)   # default backend → persistent
+    rn.run_until_idle(max_ticks=500)
+    a_outputs = [f.output for f in rn.audit_log() if f.node == "A"]
+    assert len(a_outputs) == 5
+    c_outputs = [f.output for f in rn.audit_log() if f.node == "C"]
+    assert c_outputs[-1] == a_outputs[2]   # A[3] = 3rd fire = 2
+
+
+def test_index_outside_window_missing_with_null_backend():
+    r = _reg(limit=5)
+    rn = Runner(_index_graph(r), r, backend=NullBackend())
+    rn.run_until_idle(max_ticks=500)
+    c_outputs = [f.output for f in rn.audit_log() if f.node == "C"]
+    assert c_outputs[-1] is Missing   # A[3] outside the 2-entry window → Missing
+
+
+def test_and_or_join_no_same_tick_crosstalk():
+    r = _reg()
+    g = parse(
+        "[seed]-->A\nseed.body: seed_zero\nA.body: passthru\n"
+        "A-->C\nA-->D\nC-->D\n"
+        "C.body: passthru\nD.join: OR\nD.inputs: C\nD.body: passthru",
+        registry=r,
+    )
+    rn = Runner(g, r)
+    rn.run_until_idle(max_ticks=50)
+    d_outputs = [f.output for f in rn.audit_log() if f.node == "D"]
+    # D fires at tick 1 alongside C (OR: A slot) — must NOT see C's same-tick
+    # write (Missing → passthru None); at tick 2 it sees C's previous output.
+    assert d_outputs[0] is None
+    assert d_outputs[1] == 0
