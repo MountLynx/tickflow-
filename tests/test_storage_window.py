@@ -77,3 +77,80 @@ def test_sqlite_legacy_db_migrates_node_column(tmp_path):
     assert be2.firing_at("s1", "A", 1) == "a1"
     be.close()
     be2.close()
+
+
+# --------------------------------------------------------------------------
+# Shared helpers
+# --------------------------------------------------------------------------
+
+def _reg(limit: int = 3) -> Registry:
+    r = Registry()
+    r.body("seed_zero", lambda v: 0)
+
+    @r.body("passthru")
+    def _p(v):
+        for _n, val in v.items():
+            if val is not Missing:
+                return val
+        return None
+
+    @r.body("incr")
+    def _incr(v):
+        return v.A.value + 1
+
+    r.guard("cont_ltN", lambda v: v.B.value < limit)
+    return r
+
+
+def _loop_graph(r: Registry, limit: int = 3):
+    return parse(
+        "[seed]-->A\nseed.body: seed_zero\nA.body: passthru\nA.join: OR\n"
+        "A-->B\nB.body: incr\nB--|cont_ltN|-->A",
+        registry=r,
+    )
+
+
+# --------------------------------------------------------------------------
+# A2: memory window
+# --------------------------------------------------------------------------
+
+def test_loop_window_bounded():
+    r = _reg(limit=100)
+    rn = Runner(_loop_graph(r, 100), r)
+    rn.run_until_idle(max_ticks=500)
+    assert len(rn.run_state._edges["A"]) <= 2
+    assert len(rn.run_state._edges["B"]) <= 2
+    assert len(rn.audit_log()) >= 100      # full trail still available
+
+
+def test_linear_flow_window_bounded():
+    r = _reg()
+    g = parse(
+        "[seed]-->A\nseed.body: seed_zero\nA.body: passthru\n"
+        "A-->B\nB.body: passthru\nB-->C\nC.body: passthru",
+        registry=r,
+    )
+    rn = Runner(g, r)
+    rn.run_until_idle(max_ticks=50)
+    for lst in rn.run_state._edges.values():
+        assert len(lst) <= 2
+
+
+def test_big_output_not_retained_in_memory():
+    r = Registry()
+    r.body("seed_zero", lambda v: 0)
+
+    @r.body("big")
+    def _big(v):
+        return {"payload": "x" * 100_000}
+
+    r.guard("always", lambda v: True)
+    g = parse(
+        "[seed]-->A\nseed.body: seed_zero\nA.body: big\nA.join: OR\n"
+        "A--|always|-->A",
+        registry=r,
+    )
+    rn = Runner(g, r)
+    rn.run_until_idle(max_ticks=50)
+    assert len(rn.run_state._edges["A"]) <= 2
+    assert len(rn.audit_log()) >= 20       # every big firing is on disk

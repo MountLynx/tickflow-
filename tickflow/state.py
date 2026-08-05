@@ -4,15 +4,21 @@
 a node at a given tick — inputs, output, edge propagation, status, and the
 node's mutable state after the body ran.
 
-``RunState`` manages all ``NodeState`` records and maintains three internal
+``RunState`` manages all ``NodeState`` records and maintains four internal
 layers with distinct responsibilities::
 
-    _edges   — output index, always maintained, for ``resolve()``
-    _state   — current mutable state per node, always maintained, O(1)
-    _records — full audit trail, only when ``keep_records=True``
+    _edges      — output index, always maintained, for ``resolve()``;
+                  WINDOWED to the last two firings per node (memory bound
+                  is independent of how many times a node fired)
+    _fire_counts— per-node firing counters mapping window entries back to
+                  ``A[k]`` ordinals
+    _state      — current mutable state per node, always maintained, O(1)
+    _records    — full audit trail in memory; ONLY when ``keep_records=True``
+                  AND no persistent backend (NullBackend path)
 
-Derived artefacts (audit, snapshot, persistence) are extracted from these
-three layers via the public API.
+With a persistent backend, every firing is queued by :meth:`record` and
+flushed in a per-tick batch by :meth:`flush_firings`; the backend holds the
+full history and :meth:`audit` / :meth:`firings_of` query it on demand.
 """
 
 from __future__ import annotations
@@ -113,25 +119,63 @@ class RunState:
         and node mutable state work correctly regardless of this switch.
     """
 
-    def __init__(self, keep_records: bool = True) -> None:
-        # Layer 1: output index for resolve() — always maintained.
+    def __init__(
+        self,
+        keep_records: bool = True,
+        backend: Any = None,
+        session_id: str | None = None,
+        persistent: bool = False,
+    ) -> None:
+        # Layer 1: windowed output index for resolve() — always maintained.
         self._edges: dict[str, list[tuple[int, Any]]] = {}
+        # Per-node firing counters (window → A[k] ordinal mapping).
+        self._fire_counts: dict[str, int] = {}
         # Layer 2: current mutable state per node — always maintained.
         self._state: dict[str, dict[str, Any]] = {}
-        # Layer 3: full audit records — only when keep_records=True.
+        # Layer 3: full audit records — only when keep_records AND not persistent.
         self._records: list[NodeState] = []
         self._keep_records = keep_records
+        # -- cold storage (dual-layer) --
+        self._backend = backend
+        self._session_id = session_id
+        self._persistent = persistent      # True: backend owns the full audit
+        self._pending: list[NodeState] = []  # firings queued for the next flush
+        self._audit_ceiling: int = -1        # highest tick this RunState saw
 
     # ------------------------------------------------------------------
     # Core: record a firing
     # ------------------------------------------------------------------
 
     def record(self, ns: NodeState) -> None:
-        """Record a node firing into all active layers."""
-        self._edges.setdefault(ns.node, []).append((ns.tick, ns.output))
+        """Record a node firing into all active layers.
+
+        The ``_edges`` window keeps only the last two firings per node (D1);
+        everything else is released to the backend via the pending queue
+        (flushed per tick — D3).
+        """
+        entries = self._edges.setdefault(ns.node, [])
+        entries.append((ns.tick, ns.output))
+        if len(entries) > 2:          # window: keep the last two firings only
+            del entries[0]
+        self._fire_counts[ns.node] = self._fire_counts.get(ns.node, 0) + 1
         self._state[ns.node] = dict(ns.mutable_state)  # defensive copy
-        if self._keep_records:
-            self._records.append(ns)
+        self._audit_ceiling = max(self._audit_ceiling, ns.tick)
+        if self._keep_records and not self._persistent:
+            self._records.append(ns)          # in-memory audit (NullBackend path)
+        if self._backend is not None and self._session_id is not None:
+            # Persist is orthogonal to keep_records (D11).  Batch per tick:
+            # flush the previous batch when the tick advances (bounds the
+            # queue for engine-direct callers that never flush explicitly).
+            if self._pending and self._pending[0].tick != ns.tick:
+                self.flush_firings()
+            self._pending.append(ns)
+
+    def flush_firings(self) -> None:
+        """Persist the queued firings to the backend in one batch (D3)."""
+        if not self._pending or self._backend is None or self._session_id is None:
+            return
+        batch, self._pending = self._pending, []
+        self._backend.save_firings(self._session_id, batch)
 
     # ------------------------------------------------------------------
     # Input resolution (replaces History.read)
