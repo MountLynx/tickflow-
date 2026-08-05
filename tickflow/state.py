@@ -356,10 +356,21 @@ class RunState:
         return data
 
     @classmethod
-    def from_snapshot_data(cls, d: dict) -> "RunState":
+    def from_snapshot_data(
+        cls,
+        d: dict,
+        backend: Any = None,
+        session_id: str | None = None,
+        persistent: bool = False,
+    ) -> "RunState":
         """Reconstruct from ``to_snapshot_data()`` output."""
         keep_records = d.get("keep_records", True)
-        rs = cls(keep_records=keep_records)
+        rs = cls(
+            keep_records=keep_records,
+            backend=backend,
+            session_id=session_id,
+            persistent=persistent,
+        )
         for n, lst in d.get("edges", d.get("outputs", {})).items():
             rs._edges[n] = [(int(t), v) for (t, v) in lst]
         counts = d.get("fire_counts")
@@ -379,7 +390,14 @@ class RunState:
     # ------------------------------------------------------------------
 
     def truncate_after(self, tick: int) -> None:
-        """Drop all records with ``tick > tick``."""
+        """Drop all records with ``tick > tick``.
+
+        Persistent path: the on-disk firings are retained (audit history,
+        D5); the window, fire counts, audit ceiling and ``_state`` rewind to
+        *tick*, with ``_state`` rebuilt from the last firing ≤ *tick* per
+        node in the DB.  Memory path: prune ``_records`` and rebuild
+        ``_state`` from them.
+        """
         for n in list(self._edges):
             kept = [(t, v) for (t, v) in self._edges[n] if t <= tick]
             if kept:
@@ -391,6 +409,27 @@ class RunState:
                 del self._edges[n]
                 self._state.pop(n, None)
                 self._fire_counts.pop(n, None)
+        self._audit_ceiling = min(self._audit_ceiling, tick)
+        self._pending = []
+        if self._persisted:
+            rows = self._backend.list_firings(self._session_id)
+            if rows:
+                latest: dict[str, dict] = {}
+                for d in rows:
+                    if "tick" not in d or "node" not in d:
+                        continue          # malformed row — skip
+                    if d["tick"] > tick:
+                        continue
+                    node = d["node"]
+                    if node not in latest or d["tick"] > latest[node]["tick"]:
+                        latest[node] = d
+                self._state = {
+                    n: d.get("mutable_state", {}) for n, d in latest.items()
+                }
+            # No persisted data: keep _state as reconstructed (restore path —
+            # the snapshot's state is already correct for the truncation tick).
+            self._records = []
+            return
         # Prune _records (if maintained) and rebuild _state from remaining records.
         if self._keep_records:
             self._records = [ns for ns in self._records if ns.tick <= tick]

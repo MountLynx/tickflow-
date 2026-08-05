@@ -50,6 +50,7 @@ from .ir import Graph
 from .registry import Registry, registry as _default_registry
 from .engine import Marking, tick, bootstrap, _join_satisfied
 from .state import NodeState, RunState, _jsonable
+from .persistence import NullBackend
 from .checker import check, DeadlockSuggestion, DeadlockError
 
 log = logging.getLogger(__name__)
@@ -238,7 +239,15 @@ class _BaseRunner:
         self.marking = Marking.from_json(snap["marking"])
         run_snap = snap.get("run_state", {})
         if run_snap:
-            self.run_state = RunState.from_snapshot_data(run_snap)
+            self.run_state = RunState.from_snapshot_data(
+                run_snap,
+                backend=self._backend,
+                session_id=self._session_id,
+                persistent=(
+                    self._backend is not None
+                    and not isinstance(self._backend, NullBackend)
+                ),
+            )
         else:
             # Legacy snapshot without run_state key.
             h_data = snap.get("history", {})

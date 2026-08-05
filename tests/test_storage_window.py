@@ -309,3 +309,46 @@ def test_firings_of_dispatch_direct():
         rs2.record(NodeState(tick=tick, node="A", output=v))
     assert rs2.firings_of("A") == [(3, "v2"), (5, "v3")]            # 窗口 2 条
     assert len(rs2.firings_of("A")) == 2
+
+
+# --------------------------------------------------------------------------
+# A5: snapshot / restore / truncate
+# --------------------------------------------------------------------------
+
+def test_restore_then_index_resolves_from_backend(tmp_path):
+    r = _reg(limit=5)
+    be = SqliteBackend(tmp_path / "restore.db")
+    rn = Runner(_index_graph(r), r, backend=be, session_id="s1")
+    rn.run_until_idle(max_ticks=500, pause_at={5})
+    snap = rn.snapshot()
+    rn.run_until_idle(max_ticks=500)
+    rn.restore(snap)
+    rn.run_until_idle(max_ticks=500)
+    c_outputs = [f.output for f in rn.audit_log() if f.node == "C"]
+    assert c_outputs[-1] == 2      # A[3] still resolves after restore (firings on disk)
+
+
+def test_state_rebuilt_from_backend_after_restore(tmp_path):
+    r = Registry()
+
+    @r.body("counter")
+    def _counter(v):
+        v.state["attempts"] = v.state.get("attempts", 0) + 1
+        return v.state["attempts"]
+
+    @r.guard("under_three")
+    def _under3(v):
+        return v.state.get("attempts", 0) < 3
+
+    # 与 test_node_state.py::test_state_driven_loop_terminates 同构（已知可靠模式）
+    g = parse(
+        "[A]-->B\nB.body: counter\nB--|under_three|-->B\nB.join: OR",
+        registry=r,
+    )
+    be = SqliteBackend(tmp_path / "state.db")
+    rn = Runner(g, r, backend=be, session_id="s1")
+    rn.run_until_idle(max_ticks=50, pause_at={3})
+    snap = rn.snapshot()
+    rn.run_until_idle(max_ticks=50)
+    rn.restore(snap)
+    assert "B" in rn.run_state.all_mutable_states()   # D5: state rebuilt
