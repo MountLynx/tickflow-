@@ -76,28 +76,31 @@ with distinct responsibilities:
 
 ```
 RunState
-├── _edges   dict[node, list[(tick, output)]]    always maintained, for resolve()
-├── _state   dict[node, dict[str, Any]]          always maintained, O(1) mutable state
-└── _records list[NodeState]                     only when keep_records=True, full audit trail
+    _edges   dict[node, list[(tick, output)]]    windowed (last 2 fires/node), for resolve()
+    _state   dict[node, dict]                    current mutable state per node, O(1)
+    _records list[NodeState]                     audit in memory: keep_records AND no persistent backend
 ```
 
-- **`_edges`** — fast-lookup index for `resolve()` (input resolution during
-  tick execution). Replaces the old `History` class.
+- **`_edges`** — windowed fast-lookup index for `resolve()`: only the last two
+  firings per node stay in memory; older firings live in the backend. Memory
+  usage is O(nodes × 2 × output size), independent of how many times a node fired.
 - **`_state`** — current mutable state per node (what bodies write via
   `view.state`). Always maintained, O(1) access. Replaces the old
   `Marking.node_state`.
-- **`_records`** — full `NodeState` records (inputs, output, edges_fired,
-  status, error, mutable_state). Controlled by `keep_records`.
+- **`_records`** — full `NodeState` records in memory. Maintained only when
+  `keep_records=True` **and** no persistent backend. With a backend (the
+  default), the audit lives on disk and `audit()` queries it.
 
-Derived artefacts are extracted from these three layers:
+Derived artefacts are extracted from these three layers — or from the
+backend when one is attached:
 
-| Artefact | Source | Controlled by |
-|----------|--------|---------------|
-| `resolve()` — input resolution | `_edges` | always available |
-| `mutable_state()` — node state | `_state` | always available |
-| `firings_of()` — output history | `_edges` | always available |
-| `audit()` — full audit log | `_records` | `keep_records` |
-| `to_snapshot_data()` — snapshot | all three | `records` key only when `keep_records=True` |
+| Query | Source (persistent backend) | Source (NullBackend) |
+|-------|-----------------------------|----------------------|
+| `resolve(latest)` — input resolution | `_edges` window (O(1), zero I/O) | `_edges` window (same) |
+| `resolve(index)` — k-th fire | window first, then `backend.firing_at` | window; outside → `Missing` |
+| `firings_of()` — output history | `backend.firings_of` (full) | `_edges` window |
+| `audit()` — full audit log | `backend.list_firings` | `_records` (keep_records) |
+| `to_snapshot_data()` — snapshot | window + state (+ `fire_counts`) | same |
 
 ### NodeState — one firing, all data
 
@@ -129,6 +132,12 @@ When `keep_records=False`, `_records` is not populated — saving memory — but
 state work correctly regardless of this switch. The snapshot omits the
 `"records"` key. Backend persistence (firings, snapshots) is unaffected.
 
+By default (`backend=None`) the Runner creates a temporary SQLite backend in
+the system temp dir, auto-generates a `session_id`, and removes the database
+file when the Runner is garbage-collected — so persistence, audit, checkpoints
+and `A[k]` index reads work out of the box. Pass `NullBackend()` explicitly
+for a zero-I/O in-memory run, or a concrete backend for a persistent one.
+
 ## Semantics
 
 ### The model
@@ -142,7 +151,7 @@ tick: (marking_t, run_state, t) -> (marking_{t+1}, firings_t)
 Only two mutable state containers exist:
 - **marking** — `dict[(dst, src), bool]`, one boolean *slot* per incoming
   edge, plus a set of *armed* start nodes (one-shot).
-- **run_state** — `RunState` instance (all history, state, audit).
+- **run_state** — `RunState` instance (windowed history, state, audit).
 
 There is no hidden in-flight state. That's what makes snapshots cheap.
 
@@ -230,8 +239,8 @@ rn.run_until_idle(max_ticks=100)                  # replay (identical if bodies 
 
 - **`snapshot()`** returns `{"tick", "marking", "run_state", "status",
   "cancel_reason", "fireable"}` — pure JSON. `run_state` contains `edges`
-  (output index), `state` (mutable state per node), and `records` (full audit,
-  only when `keep_records=True`).
+  (windowed output index), `state` (mutable state per node), and `records`
+  (in-memory audit, populated only when `keep_records=True` and no backend).
 - **`restore(snap)`** rewinds: sets tick/marking/run_state/status from `snap`.
   RunState records with `tick >= snap["tick"]` are dropped. A restored
   terminal status (ABORTED/CANCELLED/FAILED) is reset to IDLE so the run can
@@ -501,7 +510,7 @@ boundaries.
 three-layer `RunState` (`_edges` + `_state` + `_records`) unifies them under
 one owner with clear responsibilities. `_edges` and `_state` are always
 maintained (engine needs them); `_records` (detailed audit) is gated on
-`keep_records`.
+`keep_records` and the absence of a persistent backend.
 
 **What's deliberately out of scope:** inclusive/XOR-join syntax beyond OR;
 distributed/multi-worker scheduling; a built-in timeline forest (use
