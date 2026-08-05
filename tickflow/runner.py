@@ -31,6 +31,13 @@ The library does not maintain a "forest" of timelines. To branch, the caller
 ``copy.deepcopy(runner.snapshot())`` and constructs a second Runner per
 branch. Snapshots are plain dicts so this is cheap and explicit.
 
+With a persistent backend (the default since D6) ``snapshot()`` does not
+embed the audit trail (it lives on disk), so a branch created from a
+deep-copied snapshot has an empty ``audit_log()`` until it fires again —
+execution semantics (window, state, ``A[k]`` via the backend) are intact.
+For an audit-preserving fork use :meth:`to_json` / :meth:`from_json`, which
+carry the full trail.
+
 Body purity
 -----------
 Bodies are *expected* to be pure functions of their input view (state writes
@@ -68,7 +75,14 @@ def _make_temp_backend() -> tuple[SqliteBackend, str]:
     """
     fd, path = tempfile.mkstemp(prefix="tickflow_", suffix=".sqlite")
     os.close(fd)
-    return SqliteBackend(path), path
+    try:
+        return SqliteBackend(path), path
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
 
 
 def _cleanup_temp_db(backend: SqliteBackend, path: str) -> None:
@@ -189,7 +203,11 @@ class _BaseRunner:
         else:
             self._temp_db_path = None
         self._backend = backend
-        self._session_id = session_id or f"sess_{uuid.uuid4().hex[:8]}"
+        self._session_id = (
+            session_id
+            if session_id is not None
+            else f"sess_{uuid.uuid4().hex}"
+        )
         persistent = backend is not None and not isinstance(backend, NullBackend)
         self.run_state: RunState = RunState(
             keep_records=keep_records,
@@ -250,6 +268,7 @@ class _BaseRunner:
 
     def _persist_tick(self) -> None:
         """Persist this tick's queued firings + snapshot to the backend."""
+        # Defensive: __init__ guarantees a backend and session_id.
         if self._backend is None or self._session_id is None:
             return
         try:
@@ -318,7 +337,8 @@ class _BaseRunner:
         roundtrip carries the full trail.
         """
         data = {"snapshot": self.snapshot()}
-        if self.run_state.keep_records:
+        if self.run_state.keep_records and self._backend is not None \
+                and not isinstance(self._backend, NullBackend):
             data["snapshot"]["run_state"]["records"] = [
                 ns.to_json() for ns in self.run_state.audit()
             ]
@@ -329,16 +349,14 @@ class _BaseRunner:
         """Reconstruct a Runner from a prior :meth:`to_json` dump."""
         d = json.loads(s)
         r = cls(graph, registry, strict_deadlock=False)
-        r.restore(d["snapshot"])
-        # D6: a fresh runner's audit source is its own (temp) backend, so the
-        # embedded trail must be re-persisted for audit/firings_of/resolve to
-        # resolve from it.
+        # Re-persist the embedded audit FIRST: a fresh runner's audit source
+        # is its own (temp) backend, and restore()'s truncate_after rebuilds
+        # from the DB in the persistent path.  A backend failure here breaks
+        # the roundtrip fidelity contract, so it propagates.
         records = d.get("snapshot", {}).get("run_state", {}).get("records")
         if records and r._backend is not None and r._session_id is not None:
-            try:
-                r._backend.save_firings(r._session_id, records)
-            except Exception:
-                log.exception("from_json: re-persisting audit failed; swallowed")
+            r._backend.save_firings(r._session_id, records)
+        r.restore(d["snapshot"])
         return r
 
     # ------------------------------------------------------------------

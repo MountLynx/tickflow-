@@ -418,7 +418,10 @@ def test_truncate_persistent_branch_direct(tmp_path):
 # --------------------------------------------------------------------------
 
 def test_default_backend_temp_db_cleaned_up():
+    import tempfile as _tempfile
+
     r = _reg()
+    before = {p.name for p in Path(_tempfile.gettempdir()).iterdir()}
     rn = Runner(_loop_graph(r), r)      # no backend → temp SqliteBackend
     rn.run_until_idle(max_ticks=50)
     path = Path(rn._temp_db_path)
@@ -426,6 +429,11 @@ def test_default_backend_temp_db_cleaned_up():
     del rn
     gc.collect()
     assert not path.exists()            # cleaned up with the Runner
+    after = {p.name for p in Path(_tempfile.gettempdir()).iterdir()}
+    assert not any(
+        n.startswith("tickflow_") and n not in before
+        for n in after
+    )                                   # no temp-file residue
 
 
 def test_explicit_backend_file_persists(tmp_path):

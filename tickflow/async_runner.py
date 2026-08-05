@@ -11,6 +11,11 @@ Use AsyncRunner when a body does IO (LLM calls, HTTP, DB) -- i.e. the
 ModuleHarness case where each node runs a Harness (LLM + tools). The sync
 Runner is fine for pure-computation graphs and tests.
 
+Since D6 the default backend is a temp SQLite file (auto-cleaned), so an
+AsyncRunner created without an explicit ``backend=`` performs a small
+synchronous SQLite write at the end of every tick — fine when LLM latency
+dominates, but pass ``NullBackend()`` for zero-I/O async runs.
+
 A body or guard may be sync *or* async; the runner detects via
 ``inspect.iscoroutinefunction`` and awaits accordingly. Mixing is fine.
 
