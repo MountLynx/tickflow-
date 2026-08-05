@@ -248,7 +248,17 @@ class RunState:
     # ------------------------------------------------------------------
 
     def firings_of(self, node: str) -> list[tuple[int, Any]]:
-        """Return ``[(tick, output), ...]`` for *node*, in tick order."""
+        """Return ``[(tick, output), ...]`` for *node*, in tick order.
+
+        Persistent backend: full history from the database.  NullBackend
+        path: the in-memory window (≤ 2 entries) — D7 degradation.
+        """
+        if (
+            self._persistent
+            and self._backend is not None
+            and self._session_id is not None
+        ):
+            return self._backend.firings_of(self._session_id, node)
         return list(self._edges.get(node, []))
 
     def last_output(self, node: str) -> Any:
@@ -261,7 +271,35 @@ class RunState:
     # ------------------------------------------------------------------
 
     def audit(self) -> list[NodeState]:
-        """Full audit log. Empty when ``keep_records=False``."""
+        """Full audit log. Empty when ``keep_records=False``.
+
+        Persistent path: query the backend (all firings with ``tick`` within
+        this RunState's audit ceiling, deduplicated by ``(tick, node)`` so a
+        restore-then-replay does not double-count replayed firings).  Memory
+        path (NullBackend): ``_records`` — unchanged behaviour.
+        """
+        if not self._keep_records:
+            return []
+        if (
+            self._persistent
+            and self._backend is not None
+            and self._session_id is not None
+        ):
+            try:
+                self.flush_firings()
+            except Exception:
+                log.exception("flush_firings failed; swallowed")
+            out: list[NodeState] = []
+            seen: set[tuple[int, str]] = set()
+            for d in self._backend.list_firings(self._session_id):
+                if d.get("tick", 0) > self._audit_ceiling:
+                    continue
+                key = (d["tick"], d["node"])
+                if key in seen:
+                    continue          # replayed firing — keep the first
+                seen.add(key)
+                out.append(NodeState.from_json(d))
+            return out
         return list(self._records)
 
     def tick_firings(self, tick: int) -> list[NodeState]:

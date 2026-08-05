@@ -246,3 +246,58 @@ def test_and_or_join_no_same_tick_crosstalk():
     # write (Missing → passthru None); at tick 3 it sees C's tick-2 output.
     assert d_outputs[0] is None
     assert d_outputs[1] == 0
+
+
+# --------------------------------------------------------------------------
+# A4: audit / firings_of dispatch
+# --------------------------------------------------------------------------
+
+def test_audit_from_backend_full_and_dedup(tmp_path):
+    from tickflow.state import RunState, NodeState
+
+    be = SqliteBackend(tmp_path / "audit.db")
+    rs = RunState(backend=be, session_id="s1", persistent=True)
+    rs.record(NodeState(tick=1, node="A", output="a1"))
+    rs.record(NodeState(tick=1, node="B", output="b1"))
+    rs.record(NodeState(tick=2, node="A", output="a2"))
+    # audit() 自动 flush 尾批（无需显式 flush）
+    audit = rs.audit()
+    assert [(ns.tick, ns.node, ns.output) for ns in audit] == [
+        (1, "A", "a1"), (1, "B", "b1"), (2, "A", "a2"),
+    ]
+    assert rs._records == []                 # D4: 持久路径内存不累积
+    # 重放去重：同一 (tick, node) 再次落盘 → audit 只保留第一条
+    be.save_firings("s1", [
+        {"tick": 1, "node": "A", "output": "a1-replayed"},
+    ])
+    audit2 = rs.audit()
+    assert [(ns.tick, ns.node, ns.output) for ns in audit2] == [
+        (1, "A", "a1"), (1, "B", "b1"), (2, "A", "a2"),
+    ]
+
+
+def test_audit_empty_when_keep_records_false(tmp_path):
+    from tickflow.state import RunState, NodeState
+
+    be = SqliteBackend(tmp_path / "audit2.db")
+    rs = RunState(backend=be, session_id="s1", persistent=True, keep_records=False)
+    rs.record(NodeState(tick=1, node="A", output="a1"))
+    assert rs.audit() == []                  # keep_records 门控不变
+    rs.flush_firings()                       # 尾批落盘（runner 每 tick 驱动）
+    assert len(be.list_firings("s1")) == 1   # 但落盘与 keep_records 正交（D11）
+
+
+def test_firings_of_dispatch_direct():
+    from tickflow.state import RunState, NodeState
+
+    be = SqliteBackend(":memory:")
+    rs = RunState(backend=be, session_id="s1", persistent=True)
+    for tick, v in [(1, "v1"), (3, "v2"), (5, "v3")]:
+        rs.record(NodeState(tick=tick, node="A", output=v))
+    rs.flush_firings()
+    assert rs.firings_of("A") == [(1, "v1"), (3, "v2"), (5, "v3")]  # 全量
+    rs2 = RunState(backend=NullBackend(), session_id="s1", persistent=False)
+    for tick, v in [(1, "v1"), (3, "v2"), (5, "v3")]:
+        rs2.record(NodeState(tick=tick, node="A", output=v))
+    assert rs2.firings_of("A") == [(3, "v2"), (5, "v3")]            # 窗口 2 条
+    assert len(rs2.firings_of("A")) == 2
