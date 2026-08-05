@@ -24,10 +24,13 @@ full history and :meth:`audit` / :meth:`firings_of` query it on demand.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from .views import Missing
+
+log = logging.getLogger(__name__)
 
 
 def _jsonable(v: Any) -> Any:
@@ -91,25 +94,32 @@ class NodeState:
 class RunState:
     """Central state manager — owns all :class:`NodeState` records.
 
-    Three internal layers with distinct responsibilities::
+    Four internal layers with distinct responsibilities::
 
-        _edges   — ``dict[node, list[(tick, value)]]``
-                   Output index for fast ``resolve()``.  Always maintained.
+        _edges       — ``dict[node, list[(tick, value)]]``
+                       WINDOWED output index (last two firings per node) for
+                       fast ``resolve()``.  Always maintained.
 
-        _state   — ``dict[node, dict[str, Any]]``
-                   Current mutable state per node (latest ``mutable_state``
-                   from the most recent firing).  Always maintained, O(1).
+        _fire_counts — ``dict[node, int]``
+                       Per-node firing counters; map window entries back to
+                       ``A[k]`` ordinals.
 
-        _records — ``list[NodeState]``
-                   Full audit trail.  Only maintained when ``keep_records=True``.
+        _state       — ``dict[node, dict[str, Any]]``
+                       Current mutable state per node (latest ``mutable_state``
+                       from the most recent firing).  Always maintained, O(1).
+
+        _records     — ``list[NodeState]``
+                       Full audit trail.  Maintained only when
+                       ``keep_records=True`` AND no persistent backend; with a
+                       backend the audit lives on disk and is queried on demand.
 
     Derived artefacts
     -----------------
-    - **audit** (:meth:`audit`) → built from ``_records``.
-    - **snapshot** (:meth:`to_snapshot_data`) → ``edges`` + ``state`` always,
-      ``records`` only when audit enabled.
-    - **persistence** — backends call ``to_snapshot_data()`` for snapshots and
-      ``save_firing()`` for individual :class:`NodeState` records.
+    - **audit** (:meth:`audit`) → backend query (persistent) or ``_records``.
+    - **snapshot** (:meth:`to_snapshot_data`) → ``edges`` (window) + ``state``
+      always, ``records`` only when audit enabled.
+    - **persistence** — firings queued by :meth:`record` and flushed to the
+      backend in per-tick batches via :meth:`flush_firings`.
 
     Parameters
     ----------
@@ -117,6 +127,10 @@ class RunState:
         When False, ``_records`` is not populated (saving memory), but
         ``_edges`` and ``_state`` are still maintained — so input resolution
         and node mutable state work correctly regardless of this switch.
+    backend, session_id, persistent
+        Cold-storage wiring: when a backend is attached (and ``persistent``
+        is True) the full firing history is persisted there and the in-memory
+        audit is not maintained.
     """
 
     def __init__(
@@ -171,11 +185,19 @@ class RunState:
             self._pending.append(ns)
 
     def flush_firings(self) -> None:
-        """Persist the queued firings to the backend in one batch (D3)."""
+        """Persist the queued firings to the backend in one batch (D3).
+
+        Best-effort, matching the runner's persistence philosophy: a backend
+        failure is logged and the batch is dropped — the run itself never
+        depends on persistence succeeding.
+        """
         if not self._pending or self._backend is None or self._session_id is None:
             return
         batch, self._pending = self._pending, []
-        self._backend.save_firings(self._session_id, batch)
+        try:
+            self._backend.save_firings(self._session_id, batch)
+        except Exception:
+            log.exception("flush_firings failed; batch dropped")
 
     # ------------------------------------------------------------------
     # Input resolution (replaces History.read)

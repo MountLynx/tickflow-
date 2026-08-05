@@ -118,8 +118,10 @@ def test_loop_window_bounded():
     r = _reg(limit=100)
     rn = Runner(_loop_graph(r, 100), r)
     rn.run_until_idle(max_ticks=500)
-    assert len(rn.run_state._edges["A"]) <= 2
-    assert len(rn.run_state._edges["B"]) <= 2
+    assert len(rn.run_state._edges["A"]) == 2
+    assert len(rn.run_state._edges["B"]) == 2
+    # 窗口保留最近两次触发：A 输出 0..99，最后一条为 99
+    assert rn.run_state._edges["A"][-1][1] == 99
     assert len(rn.audit_log()) >= 100      # full trail still available
 
 
@@ -136,21 +138,34 @@ def test_linear_flow_window_bounded():
         assert len(lst) <= 2
 
 
-def test_big_output_not_retained_in_memory():
-    r = Registry()
-    r.body("seed_zero", lambda v: 0)
+def test_big_output_not_retained_in_memory(tmp_path):
+    # 直接驱动 RunState + 持久 backend：大 output 只留窗口两条，
+    # 内存 _records 不累积，全量在库（D3/D4 语义）
+    from tickflow.state import RunState, NodeState
 
-    @r.body("big")
-    def _big(v):
-        return {"payload": "x" * 100_000}
+    be = SqliteBackend(tmp_path / "big.db")
+    rs = RunState(backend=be, session_id="s1", persistent=True)
+    payload = {"payload": "x" * 100_000}
+    for tick in range(1, 21):
+        rs.record(NodeState(tick=tick, node="A", output=payload))
+    assert len(rs._edges["A"]) <= 2
+    assert rs._edges["A"][-1][1] is payload   # 窗口保留最近一次触发
+    assert rs._records == []                  # 内存不累积（D4）
+    rs.flush_firings()                        # 尾批落盘
+    fs = be.firings_of("s1", "A")
+    assert len(fs) == 20                      # 全量在库（D3）
 
-    r.guard("always", lambda v: True)
-    g = parse(
-        "[seed]-->A\nseed.body: seed_zero\nA.body: big\nA.join: OR\n"
-        "A--|always|-->A",
-        registry=r,
-    )
-    rn = Runner(g, r)
-    rn.run_until_idle(max_ticks=50)
-    assert len(rn.run_state._edges["A"]) <= 2
-    assert len(rn.audit_log()) >= 20       # every big firing is on disk
+
+def test_pending_queue_batches_per_tick_and_flushes():
+    from tickflow.state import RunState, NodeState
+
+    be = NullBackend()
+    rs = RunState(backend=be, session_id="s1", persistent=True)
+    rs.record(NodeState(tick=1, node="A", output="a1"))
+    rs.record(NodeState(tick=1, node="B", output="b1"))
+    assert be.list_firings("s1") == []        # 未跨 tick：不 flush
+    rs.record(NodeState(tick=2, node="A", output="a2"))   # tick 推进 → 第一批落盘
+    assert [f["node"] for f in be.list_firings("s1")] == ["A", "B"]
+    assert len(rs._pending) == 1              # 队列只剩第二批
+    rs.flush_firings()                        # 尾批显式 flush
+    assert [f["node"] for f in be.list_firings("s1")] == ["A", "B", "A"]
