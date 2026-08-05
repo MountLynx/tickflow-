@@ -95,8 +95,9 @@ class Backend(Protocol):
         ...
 
     def firings_of(self, session_id: str, node: str) -> list[tuple[int, Any]]:
-        """All ``(tick, output)`` pairs for *node*, in tick order.  Cold
-        query backing ``RunState.firings_of`` (D8)."""
+        """All ``(tick, output)`` pairs for *node*, in append order (which
+        equals tick order for a real run — a node fires at most once per
+        tick).  Cold query backing ``RunState.firings_of`` (D8)."""
         ...
 
     def save_checkpoint(self, session_id: str, label: str, snap: dict) -> None:
@@ -263,18 +264,19 @@ class JsonBackend:
                 out.append(d)
         return out
 
+    def _node_firings(self, session_id: str, node: str) -> list[dict]:
+        return [d for d in self.list_firings(session_id) if d.get("node") == node]
+
     def firing_at(self, session_id: str, node: str, k: int) -> Any | None:
-        fs = [d for d in self.list_firings(session_id) if d.get("node") == node]
+        fs = self._node_firings(session_id, node)
         if k < 1 or k > len(fs):
             return None
         return fs[k - 1].get("output")
 
     def firings_of(self, session_id: str, node: str) -> list[tuple[int, Any]]:
-        return [
-            (d["tick"], d.get("output"))
-            for d in self.list_firings(session_id)
-            if d.get("node") == node
-        ]
+        """All ``(tick, output)`` pairs for *node*, in append order
+        (== tick order for a real run)."""
+        return [(d["tick"], d.get("output")) for d in self._node_firings(session_id, node)]
 
     # -- checkpoints -------------------------------------------------------
 
@@ -432,7 +434,7 @@ class SqliteBackend:
     def save_firing(self, session_id: str, firing: Any) -> None:
         d = firing.to_json() if hasattr(firing, "to_json") else dict(firing)
         tick = d.get("tick", 0)
-        node = str(d.get("node", ""))
+        node = str(d.get("node") or "")
         with self._lock:
             self._conn.execute(
                 "INSERT INTO firings (session_id, tick, node, data) VALUES (?, ?, ?, ?)",
@@ -447,7 +449,7 @@ class SqliteBackend:
         rows = []
         for firing in firings:
             d = firing.to_json() if hasattr(firing, "to_json") else dict(firing)
-            rows.append((session_id, d.get("tick", 0), str(d.get("node", "")),
+            rows.append((session_id, d.get("tick", 0), str(d.get("node") or ""),
                          json.dumps(d, default=_default)))
         with self._lock:
             self._conn.executemany(
@@ -465,6 +467,8 @@ class SqliteBackend:
         return [json.loads(r[0]) for r in rows]
 
     def firing_at(self, session_id: str, node: str, k: int) -> Any | None:
+        if k < 1:
+            return None
         with self._lock:
             row = self._conn.execute(
                 "SELECT data FROM firings WHERE session_id = ? AND node = ? "
@@ -476,6 +480,8 @@ class SqliteBackend:
         return json.loads(row[0]).get("output")
 
     def firings_of(self, session_id: str, node: str) -> list[tuple[int, Any]]:
+        """All ``(tick, output)`` pairs for *node*, in append order
+        (== tick order for a real run)."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT data FROM firings WHERE session_id = ? AND node = ? "
