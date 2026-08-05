@@ -212,12 +212,16 @@ class RunState:
         reads degrade to ``Missing`` on the NullBackend path, D2/D7).
         """
         if kind == "index":
+            # k is a 1-based ordinal; guard up front so the window query and
+            # the backend branch never depend on normalising a bad k.
+            if k is None or k < 1:
+                return Missing
             # Window first: the last two fires resolve from memory (O(1)),
             # including the current tick's just-recorded fire — preserving the
             # same-tick visibility of the old full-history behaviour.
             entries = self._edges.get(node, [])
             count = self._fire_counts.get(node, 0)
-            if entries and k is not None and 1 <= k <= count:
+            if entries and k <= count:
                 lo = count - len(entries) + 1
                 if k >= lo:
                     return entries[k - lo][1]
@@ -227,7 +231,7 @@ class RunState:
                 and self._backend is not None
                 and self._session_id is not None
             ):
-                v = self._backend.firing_at(self._session_id, node, k or 0)
+                v = self._backend.firing_at(self._session_id, node, k)
                 return Missing if v is None else v
             return Missing
         # latest_before(t) — window scan (≤ 2 entries, O(1))
@@ -305,6 +309,7 @@ class RunState:
                 n: [[t, _jsonable(v)] for (t, v) in lst]
                 for n, lst in self._edges.items()
             },
+            "fire_counts": dict(self._fire_counts),
             "state": {n: dict(s) for n, s in self._state.items()},
             "keep_records": self._keep_records,
         }
@@ -319,6 +324,12 @@ class RunState:
         rs = cls(keep_records=keep_records)
         for n, lst in d.get("edges", d.get("outputs", {})).items():
             rs._edges[n] = [(int(t), v) for (t, v) in lst]
+        counts = d.get("fire_counts")
+        if counts:
+            rs._fire_counts = {n: int(c) for n, c in counts.items()}
+        else:
+            # Legacy snapshot: edges held the FULL history — one entry per fire.
+            rs._fire_counts = {n: len(lst) for n, lst in rs._edges.items()}
         for n, s in d.get("state", {}).items():
             rs._state[n] = dict(s)
         for rec in d.get("records", []):
@@ -334,10 +345,14 @@ class RunState:
         for n in list(self._edges):
             kept = [(t, v) for (t, v) in self._edges[n] if t <= tick]
             if kept:
+                pruned = len(self._edges[n]) - len(kept)
                 self._edges[n] = kept
+                if n in self._fire_counts:
+                    self._fire_counts[n] -= pruned
             else:
                 del self._edges[n]
                 self._state.pop(n, None)
+                self._fire_counts.pop(n, None)
         # Prune _records (if maintained) and rebuild _state from remaining records.
         if self._keep_records:
             self._records = [ns for ns in self._records if ns.tick <= tick]
@@ -358,6 +373,7 @@ class RunState:
             if n not in node_names:
                 del self._edges[n]
                 self._state.pop(n, None)
+                self._fire_counts.pop(n, None)
         self._records = [ns for ns in self._records if ns.node in node_names]
 
     # ------------------------------------------------------------------

@@ -190,7 +190,9 @@ def _index_graph(r: Registry, k: str = "A[3]"):
 
 def test_index_resolves_from_backend():
     r = _reg(limit=5)              # A fires 5 times (values 0..4)
-    rn = Runner(_index_graph(r), r)   # default backend → persistent
+    # A6 前 Runner 未接线 backend（persistent=False）：窗口外 A[3] 降级 Missing，
+    # A6 接通 backend 后经 firing_at 冷查询解析为 2
+    rn = Runner(_index_graph(r), r)
     rn.run_until_idle(max_ticks=500)
     a_outputs = [f.output for f in rn.audit_log() if f.node == "A"]
     assert len(a_outputs) == 5
@@ -206,6 +208,29 @@ def test_index_outside_window_missing_with_null_backend():
     assert c_outputs[-1] is Missing   # A[3] outside the 2-entry window → Missing
 
 
+def test_index_dispatch_window_backend_null(tmp_path):
+    # 直接驱动 RunState：窗口命中 / 窗口外 backend 冷查询 / NullBackend 降级
+    from tickflow.state import RunState, NodeState
+
+    be = SqliteBackend(tmp_path / "idx.db")
+    rs = RunState(backend=be, session_id="s1", persistent=True)
+    for tick, v in [(1, "v1"), (3, "v2"), (5, "v3"), (7, "v4"), (9, "v5")]:
+        rs.record(NodeState(tick=tick, node="A", output=v))
+    rs.flush_firings()
+    assert rs.resolve("A", "index", 4, 99) == "v4"      # 窗口内
+    assert rs.resolve("A", "index", 5, 99) == "v5"
+    assert rs.resolve("A", "index", 3, 99) == "v3"      # 窗口外 → backend
+    assert rs.resolve("A", "index", 1, 99) == "v1"
+    assert rs.resolve("A", "index", 6, 99) is Missing   # 只有 5 次
+    assert rs.resolve("A", "index", 0, 99) is Missing   # k<1 守卫
+    # NullBackend：窗口内命中、窗口外降级
+    rs2 = RunState(backend=NullBackend(), session_id="s1", persistent=False)
+    for tick, v in [(1, "v1"), (3, "v2"), (5, "v3"), (7, "v4"), (9, "v5")]:
+        rs2.record(NodeState(tick=tick, node="A", output=v))
+    assert rs2.resolve("A", "index", 5, 99) == "v5"
+    assert rs2.resolve("A", "index", 3, 99) is Missing  # 窗口外降级（D7）
+
+
 def test_and_or_join_no_same_tick_crosstalk():
     r = _reg()
     g = parse(
@@ -217,7 +242,7 @@ def test_and_or_join_no_same_tick_crosstalk():
     rn = Runner(g, r)
     rn.run_until_idle(max_ticks=50)
     d_outputs = [f.output for f in rn.audit_log() if f.node == "D"]
-    # D fires at tick 1 alongside C (OR: A slot) — must NOT see C's same-tick
-    # write (Missing → passthru None); at tick 2 it sees C's previous output.
+    # D fires at tick 2 alongside C (OR: A slot) — must NOT see C's same-tick
+    # write (Missing → passthru None); at tick 3 it sees C's tick-2 output.
     assert d_outputs[0] is None
     assert d_outputs[1] == 0
