@@ -37,27 +37,34 @@ def _loop_graph(r):
     )
 
 
-def test_null_backend_records_snapshots_and_firings():
+def test_null_backend_records_firings_but_no_snapshots():
+    """Fast mode (D7): firings are recorded, per-tick snapshots are skipped.
+
+    A per-tick snapshot embeds the full in-memory audit (O(n^2) serialization
+    over a long run) and has no consumer in a zero-persistence run; named
+    checkpoints still work via explicit save_checkpoint.
+    """
     r = _reg()
     g = _loop_graph(r)
     be = NullBackend()
     rn = Runner(g, r, backend=be, session_id="s1")
     rn.run_until_idle(max_ticks=20)
-    # Snapshots saved at each tick (1..final).
+    # No per-tick snapshots in fast mode.
     snaps = be.list_snapshots("s1")
-    assert snaps == list(range(1, rn.tick_count + 1))
-    # Firings recorded.
+    assert snaps == []
+    # Firings still recorded.
     fs = be.list_firings("s1")
     assert len(fs) == len(rn.audit_log())
 
 
-def test_null_backend_latest_tick():
+def test_null_backend_latest_tick_none():
+    """Fast mode records no per-tick snapshots, so latest_tick stays None."""
     r = _reg()
     g = _loop_graph(r)
     be = NullBackend()
     rn = Runner(g, r, backend=be, session_id="s1")
     rn.run_until_idle(max_ticks=20)
-    assert be.latest_tick("s1") == rn.tick_count
+    assert be.latest_tick("s1") is None
 
 
 def test_json_backend_writes_files(tmp_path):

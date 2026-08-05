@@ -209,6 +209,7 @@ class _BaseRunner:
             else f"sess_{uuid.uuid4().hex}"
         )
         persistent = backend is not None and not isinstance(backend, NullBackend)
+        self._persistent = persistent
         self.run_state: RunState = RunState(
             keep_records=keep_records,
             backend=backend,
@@ -273,7 +274,12 @@ class _BaseRunner:
             return
         try:
             self.run_state.flush_firings()
-            self._backend.save_snapshot(self._session_id, self.tick_count, self.snapshot())
+            if self._persistent:
+                # Fast mode (NullBackend) skips per-tick snapshots: they embed
+                # the full in-memory audit (O(n^2) serialization over the run)
+                # and have no consumer in a zero-persistence run (D7).
+                # checkpoint()/rollback_to() still work via explicit labels.
+                self._backend.save_snapshot(self._session_id, self.tick_count, self.snapshot())
         except Exception:
             log.exception("backend persistence failed; swallowed")
 
