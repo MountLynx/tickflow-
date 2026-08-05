@@ -268,15 +268,34 @@ class JsonBackend:
         return [d for d in self.list_firings(session_id) if d.get("node") == node]
 
     def firing_at(self, session_id: str, node: str, k: int) -> Any | None:
-        fs = self._node_firings(session_id, node)
-        if k < 1 or k > len(fs):
+        """The output of *node*'s k-th distinct-tick firing (1-based), or
+        None if it has fired fewer than k times.  Rows are deduplicated by
+        tick (keep-first) so restore-then-replay writes of the same
+        (tick, node) do not shift the k-th firing contract."""
+        if k < 1:
             return None
-        return fs[k - 1].get("output")
+        seen: set[int] = set()
+        n = 0
+        for d in self._node_firings(session_id, node):
+            if d.get("tick") in seen:
+                continue
+            seen.add(d["tick"])
+            n += 1
+            if n == k:
+                return d.get("output")
+        return None
 
     def firings_of(self, session_id: str, node: str) -> list[tuple[int, Any]]:
-        """All ``(tick, output)`` pairs for *node*, in append order
-        (== tick order for a real run)."""
-        return [(d["tick"], d.get("output")) for d in self._node_firings(session_id, node)]
+        """All ``(tick, output)`` pairs for *node* in first-append order,
+        deduplicated by tick (a node fires at most once per tick)."""
+        seen: set[int] = set()
+        out: list[tuple[int, Any]] = []
+        for d in self._node_firings(session_id, node):
+            if d.get("tick") in seen:
+                continue
+            seen.add(d["tick"])
+            out.append((d["tick"], d.get("output")))
+        return out
 
     # -- checkpoints -------------------------------------------------------
 
@@ -467,12 +486,18 @@ class SqliteBackend:
         return [json.loads(r[0]) for r in rows]
 
     def firing_at(self, session_id: str, node: str, k: int) -> Any | None:
+        """The output of *node*'s k-th distinct-tick firing (1-based), or
+        None if it has fired fewer than k times.  Rows are deduplicated by
+        tick (keep-first) so restore-then-replay writes of the same
+        (tick, node) do not shift the k-th firing contract."""
         if k < 1:
             return None
         with self._lock:
             row = self._conn.execute(
-                "SELECT data FROM firings WHERE session_id = ? AND node = ? "
-                "ORDER BY id LIMIT 1 OFFSET ?",
+                "SELECT data FROM ("
+                "SELECT data, MIN(id) AS mid FROM firings "
+                "WHERE session_id = ? AND node = ? GROUP BY tick"
+                ") ORDER BY mid LIMIT 1 OFFSET ?",
                 (session_id, node, k - 1),
             ).fetchone()
         if row is None:
@@ -480,12 +505,14 @@ class SqliteBackend:
         return json.loads(row[0]).get("output")
 
     def firings_of(self, session_id: str, node: str) -> list[tuple[int, Any]]:
-        """All ``(tick, output)`` pairs for *node*, in append order
-        (== tick order for a real run)."""
+        """All ``(tick, output)`` pairs for *node* in first-append order,
+        deduplicated by tick (a node fires at most once per tick)."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT data FROM firings WHERE session_id = ? AND node = ? "
-                "ORDER BY id",
+                "SELECT data FROM ("
+                "SELECT data, MIN(id) AS mid FROM firings "
+                "WHERE session_id = ? AND node = ? GROUP BY tick"
+                ") ORDER BY mid",
                 (session_id, node),
             ).fetchall()
         out: list[tuple[int, Any]] = []

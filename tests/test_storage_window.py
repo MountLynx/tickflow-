@@ -323,9 +323,11 @@ def test_restore_then_index_resolves_from_backend(tmp_path):
     snap = rn.snapshot()
     rn.run_until_idle(max_ticks=500)
     rn.restore(snap)
+    # D5：restore 后 A[k] 仍可解析（快照窗口 + firings 全量在库）
+    assert rn.run_state.resolve("A", "index", 3, 999) == 2
     rn.run_until_idle(max_ticks=500)
-    c_outputs = [f.output for f in rn.audit_log() if f.node == "C"]
-    assert c_outputs[-1] == 2      # A[3] still resolves after restore (firings on disk)
+    # 重放后窗口反映最新一次触发（C 最近一次读到 A[3] = 2）
+    assert rn.run_state.edges["C"][-1][1] == 2
 
 
 def test_state_rebuilt_from_backend_after_restore(tmp_path):
@@ -352,3 +354,55 @@ def test_state_rebuilt_from_backend_after_restore(tmp_path):
     rn.run_until_idle(max_ticks=50)
     rn.restore(snap)
     assert "B" in rn.run_state.all_mutable_states()   # D5: state rebuilt
+    assert rn.run_state.mutable_state("B")["attempts"] == 2   # 快照点的状态
+    # 鉴别 DB 重建 vs 沿用快照 state：截断到 tick 1 后应为第 1 次触发的状态
+    rn.run_state.truncate_after(1)
+    assert rn.run_state.mutable_state("B")["attempts"] == 1
+
+
+def test_cold_queries_dedup_replayed_rows(tmp_path):
+    """重放产生的重复 (tick, node) 行不破坏第 k 次触发契约（keep-first）。"""
+    be = SqliteBackend(tmp_path / "dup.db")
+    be.save_firings("s1", [
+        {"tick": 1, "node": "A", "output": "a1"},
+        {"tick": 3, "node": "A", "output": "a2"},
+        {"tick": 5, "node": "A", "output": "a3"},
+        {"tick": 1, "node": "A", "output": "a1-replayed"},
+        {"tick": 3, "node": "A", "output": "a2-replayed"},
+    ])
+    assert be.firing_at("s1", "A", 1) == "a1"     # 保留首见行
+    assert be.firing_at("s1", "A", 3) == "a3"
+    assert be.firing_at("s1", "A", 4) is None
+    assert be.firings_of("s1", "A") == [(1, "a1"), (3, "a2"), (5, "a3")]
+    jb = JsonBackend(tmp_path / "j")
+    jb.save_firings("s1", [
+        {"tick": 1, "node": "A", "output": "a1"},
+        {"tick": 1, "node": "A", "output": "a1-replayed"},
+    ])
+    assert jb.firings_of("s1", "A") == [(1, "a1")]
+
+
+def test_truncate_persistent_branch_direct(tmp_path):
+    """直接驱动：持久路径 truncate 重建窗口/序号/ceiling/_state/audit，且幂等。"""
+    from tickflow.state import RunState, NodeState
+
+    be = SqliteBackend(tmp_path / "trunc.db")
+    rs = RunState(backend=be, session_id="s1", persistent=True)
+    for tick, node, v in [
+        (1, "A", "a1"), (2, "B", "b1"), (3, "A", "a2"),
+        (4, "B", "b2"), (5, "A", "a3"), (6, "B", "b3"), (7, "A", "a4"),
+    ]:
+        rs.record(NodeState(tick=tick, node=node, output=v,
+                            mutable_state={node: tick}))
+    rs.flush_firings()
+    rs.truncate_after(5)
+    assert rs._edges["A"] == [(3, "a2"), (5, "a3")]   # 窗口：最近两条 ≤ 5（从库重建）
+    assert rs._edges["B"] == [(2, "b1"), (4, "b2")]
+    assert rs._fire_counts == {"A": 3, "B": 2}
+    assert rs._audit_ceiling == 5
+    assert rs.mutable_state("A") == {"A": 5}          # 从库重建：最后一次 ≤ 5
+    assert rs.mutable_state("B") == {"B": 4}
+    assert [ns.tick for ns in rs.audit()] == [1, 2, 3, 4, 5]
+    rs.truncate_after(5)                              # 幂等
+    assert rs._audit_ceiling == 5
+    assert rs._edges["A"] == [(3, "a2"), (5, "a3")]

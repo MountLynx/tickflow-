@@ -394,9 +394,10 @@ class RunState:
 
         Persistent path: the on-disk firings are retained (audit history,
         D5); the window, fire counts, audit ceiling and ``_state`` rewind to
-        *tick*, with ``_state`` rebuilt from the last firing ≤ *tick* per
-        node in the DB.  Memory path: prune ``_records`` and rebuild
-        ``_state`` from them.
+        *tick*, rebuilt from the persisted history (the last two firings
+        ≤ *tick* per node, and each node's last firing ≤ *tick* for
+        ``_state``).  Memory path: prune ``_records`` and rebuild ``_state``
+        from them.
         """
         for n in list(self._edges):
             kept = [(t, v) for (t, v) in self._edges[n] if t <= tick]
@@ -409,25 +410,48 @@ class RunState:
                 del self._edges[n]
                 self._state.pop(n, None)
                 self._fire_counts.pop(n, None)
-        self._audit_ceiling = min(self._audit_ceiling, tick)
+        self._audit_ceiling = (
+            tick if self._audit_ceiling < 0 else min(self._audit_ceiling, tick)
+        )
         self._pending = []
         if self._persisted:
+            self.flush_firings()   # 未落盘的尾批先入库（runner 路径为 no-op）
             rows = self._backend.list_firings(self._session_id)
             if rows:
+                # Rebuild the window, firing ordinals and mutable state from
+                # the persisted history: the last two firings ≤ *tick* per
+                # node (replayed duplicates keep their first row, like
+                # audit()).
                 latest: dict[str, dict] = {}
+                counts: dict[str, int] = {}
+                edges: dict[str, list[tuple[int, Any]]] = {}
+                seen: set[tuple[int, str]] = set()
                 for d in rows:
                     if "tick" not in d or "node" not in d:
                         continue          # malformed row — skip
                     if d["tick"] > tick:
                         continue
+                    key = (d["tick"], d["node"])
+                    if key in seen:
+                        continue          # replayed firing — keep the first
+                    seen.add(key)
                     node = d["node"]
+                    counts[node] = counts.get(node, 0) + 1
+                    lst = edges.setdefault(node, [])
+                    lst.append((d["tick"], d.get("output")))
+                    if len(lst) > 2:      # window: keep the last two firings only
+                        del lst[0]
                     if node not in latest or d["tick"] > latest[node]["tick"]:
                         latest[node] = d
+                self._edges = edges
+                self._fire_counts = counts
                 self._state = {
                     n: d.get("mutable_state", {}) for n, d in latest.items()
                 }
-            # No persisted data: keep _state as reconstructed (restore path —
-            # the snapshot's state is already correct for the truncation tick).
+            # No persisted rows: nothing to rebuild from — keep _state as
+            # reconstructed (restore path: the snapshot's state is already
+            # correct for the truncation tick; a session with no persisted
+            # history has no observable state either way).
             self._records = []
             return
         # Prune _records (if maintained) and rebuild _state from remaining records.
@@ -436,7 +460,7 @@ class RunState:
             self._state.clear()
             for ns in reversed(self._records):
                 if ns.node not in self._state:
-                    self._state[ns.node] = ns.mutable_state
+                    self._state[ns.node] = dict(ns.mutable_state)
         else:
             self._records = []
 
