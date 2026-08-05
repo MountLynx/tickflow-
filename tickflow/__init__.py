@@ -44,7 +44,7 @@ from .registry import Registry, registry, Body, Guard
 from .engine import Marking, tick, bootstrap
 from .state import NodeState, RunState
 from .runner import Runner, RunStatus
-from .persistence import Backend, JsonBackend, SqliteBackend
+from .persistence import Backend, JsonBackend, NullBackend, SqliteBackend
 
 __all__ = [
     "Graph",
@@ -74,5 +74,6 @@ __all__ = [
     "RunStatus",
     "Backend",
     "JsonBackend",
+    "NullBackend",
     "SqliteBackend",
 ]
