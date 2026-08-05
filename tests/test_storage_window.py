@@ -383,7 +383,10 @@ def test_cold_queries_dedup_replayed_rows(tmp_path):
 
 
 def test_truncate_persistent_branch_direct(tmp_path):
-    """直接驱动：持久路径 truncate 重建窗口/序号/ceiling/_state/audit，且幂等。"""
+    """直接驱动：持久路径 truncate 重建窗口/序号/ceiling/_state/audit，且幂等。
+
+    不预 flush：truncate 内部的 flush 负责未落盘尾批入库（覆盖尾批场景）。
+    """
     from tickflow.state import RunState, NodeState
 
     be = SqliteBackend(tmp_path / "trunc.db")
@@ -394,15 +397,17 @@ def test_truncate_persistent_branch_direct(tmp_path):
     ]:
         rs.record(NodeState(tick=tick, node=node, output=v,
                             mutable_state={node: tick}))
-    rs.flush_firings()
-    rs.truncate_after(5)
-    assert rs._edges["A"] == [(3, "a2"), (5, "a3")]   # 窗口：最近两条 ≤ 5（从库重建）
+    rs.truncate_after(5)          # 内部 flush 尾批（tick 6/7）后重建
+    assert rs._edges["A"] == [(3, "a2"), (5, "a3")]   # 窗口：最近两条 ≤ 5
     assert rs._edges["B"] == [(2, "b1"), (4, "b2")]
     assert rs._fire_counts == {"A": 3, "B": 2}
     assert rs._audit_ceiling == 5
     assert rs.mutable_state("A") == {"A": 5}          # 从库重建：最后一次 ≤ 5
     assert rs.mutable_state("B") == {"B": 4}
     assert [ns.tick for ns in rs.audit()] == [1, 2, 3, 4, 5]
+    # D5：落盘记录不因 truncate 丢失（库中全量保留）
+    assert len(be.firings_of("s1", "A")) == 4
+    assert len(be.firings_of("s1", "B")) == 3
     rs.truncate_after(5)                              # 幂等
     assert rs._audit_ceiling == 5
     assert rs._edges["A"] == [(3, "a2"), (5, "a3")]

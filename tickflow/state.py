@@ -413,9 +413,12 @@ class RunState:
         self._audit_ceiling = (
             tick if self._audit_ceiling < 0 else min(self._audit_ceiling, tick)
         )
+        # 未落盘的尾批先入库（runner 路径 pending 恒空，为 no-op）；
+        # 清空放后面，避免 flush 变死代码。
+        if self._backend is not None and self._session_id is not None:
+            self.flush_firings()
         self._pending = []
         if self._persisted:
-            self.flush_firings()   # 未落盘的尾批先入库（runner 路径为 no-op）
             rows = self._backend.list_firings(self._session_id)
             if rows:
                 # Rebuild the window, firing ordinals and mutable state from
