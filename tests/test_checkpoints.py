@@ -34,11 +34,17 @@ def _loop_graph(r):
     )
 
 
-def test_checkpoint_requires_backend():
+def test_checkpoint_works_with_default_backend():
+    """D6: the default temp backend makes named checkpoints available without
+    any explicit backend/session_id."""
     r = _reg()
     rn = Runner(_loop_graph(r), r)
-    with pytest.raises(RuntimeError):
-        rn.checkpoint("after_prep")
+    rn.run_until_idle(max_ticks=20, pause_at={3})
+    rn.checkpoint("cp1")
+    assert ("cp1", 3) in rn.list_checkpoints()
+    rn.run_until_idle(max_ticks=20)
+    rn.rollback_to("cp1")
+    assert rn.tick_count == 3
 
 
 def test_checkpoint_save_and_list():

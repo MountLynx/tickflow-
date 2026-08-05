@@ -205,7 +205,7 @@ class AsyncRunner(_BaseRunner):
         else:
             self.status = RunStatus.RUNNING
         await self._run_tick_end_hooks(self.tick_count - 1, firings)
-        self._persist_tick(firings)
+        self._persist_tick()
         return firings
 
     async def run_until_idle(

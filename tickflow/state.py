@@ -304,6 +304,8 @@ class RunState:
 
     def tick_firings(self, tick: int) -> list[NodeState]:
         """All :class:`NodeState` records for a given *tick*."""
+        if self._persisted:
+            return [ns for ns in self.audit() if ns.tick == tick]
         return [ns for ns in self._records if ns.tick == tick]
 
     @property

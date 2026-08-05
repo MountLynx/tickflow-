@@ -44,16 +44,46 @@ from __future__ import annotations
 import enum
 import json
 import logging
+import os
+import tempfile
+import uuid
+import weakref
 from typing import Any, Callable, Iterable
 
 from .ir import Graph
 from .registry import Registry, registry as _default_registry
 from .engine import Marking, tick, bootstrap, _join_satisfied
 from .state import NodeState, RunState, _jsonable
-from .persistence import NullBackend
+from .persistence import NullBackend, SqliteBackend
 from .checker import check, DeadlockSuggestion, DeadlockError
 
 log = logging.getLogger(__name__)
+
+
+def _make_temp_backend() -> tuple[SqliteBackend, str]:
+    """Create a temp-file SqliteBackend in the system temp dir (D6).
+
+    The file is removed when the Runner is garbage-collected (see
+    :func:`_cleanup_temp_db`); explicit ``backend=`` callers keep their file.
+    """
+    fd, path = tempfile.mkstemp(prefix="tickflow_", suffix=".sqlite")
+    os.close(fd)
+    return SqliteBackend(path), path
+
+
+def _cleanup_temp_db(backend: SqliteBackend, path: str) -> None:
+    """Close the temp backend and unlink the DB file (+ WAL/SHM siblings)."""
+    try:
+        backend.close()
+    except Exception:
+        log.exception("closing temp backend failed; swallowed")
+    for p in (path, path + "-wal", path + "-shm"):
+        try:
+            os.unlink(p)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            log.exception("unlink %r failed; swallowed", p)
 
 
 def _validate_registry_for_graph(graph: Graph, registry: Registry) -> None:
@@ -152,12 +182,24 @@ class _BaseRunner:
         self.graph = graph
         self.registry = registry if registry is not None else _default_registry
         self.marking: Marking = bootstrap(graph)
-        self.run_state: RunState = RunState(keep_records=keep_records)
+        if backend is None:
+            # D6: default = temp SqliteBackend, cleaned up with the Runner.
+            backend, self._temp_db_path = _make_temp_backend()
+            weakref.finalize(self, _cleanup_temp_db, backend, self._temp_db_path)
+        else:
+            self._temp_db_path = None
+        self._backend = backend
+        self._session_id = session_id or f"sess_{uuid.uuid4().hex[:8]}"
+        persistent = backend is not None and not isinstance(backend, NullBackend)
+        self.run_state: RunState = RunState(
+            keep_records=keep_records,
+            backend=backend,
+            session_id=self._session_id,
+            persistent=persistent,
+        )
         self.tick_count: int = 0
         self.status: RunStatus = RunStatus.IDLE
         self.cancel_reason: str | None = None
-        self._backend = backend
-        self._session_id = session_id
         if strict_deadlock:
             pending = check(graph)
             if pending:
@@ -206,13 +248,12 @@ class _BaseRunner:
     # Persistence helper
     # ------------------------------------------------------------------
 
-    def _persist_tick(self, firings: list[NodeState]) -> None:
-        """Persist this tick's snapshot + firings to the backend, if any."""
+    def _persist_tick(self) -> None:
+        """Persist this tick's queued firings + snapshot to the backend."""
         if self._backend is None or self._session_id is None:
             return
         try:
-            if firings:
-                self._backend.save_firings(self._session_id, firings)
+            self.run_state.flush_firings()
             self._backend.save_snapshot(self._session_id, self.tick_count, self.snapshot())
         except Exception:
             log.exception("backend persistence failed; swallowed")
@@ -270,10 +311,18 @@ class _BaseRunner:
 
     def to_json(self) -> str:
         """Full state as a single JSON string.  Audit trail lives under
-        ``snapshot.run_state.records``."""
-        return json.dumps({
-            "snapshot": self.snapshot(),
-        }, indent=2, default=_jsonable)
+        ``snapshot.run_state.records``.
+
+        With a persistent backend the audit lives on disk (D4), so it is
+        re-embedded here from :meth:`audit_log` so a :meth:`from_json`
+        roundtrip carries the full trail.
+        """
+        data = {"snapshot": self.snapshot()}
+        if self.run_state.keep_records:
+            data["snapshot"]["run_state"]["records"] = [
+                ns.to_json() for ns in self.run_state.audit()
+            ]
+        return json.dumps(data, indent=2, default=_jsonable)
 
     @classmethod
     def from_json(cls, s: str, graph: Graph, registry: Registry | None = None) -> "Runner":
@@ -281,6 +330,15 @@ class _BaseRunner:
         d = json.loads(s)
         r = cls(graph, registry, strict_deadlock=False)
         r.restore(d["snapshot"])
+        # D6: a fresh runner's audit source is its own (temp) backend, so the
+        # embedded trail must be re-persisted for audit/firings_of/resolve to
+        # resolve from it.
+        records = d.get("snapshot", {}).get("run_state", {}).get("records")
+        if records and r._backend is not None and r._session_id is not None:
+            try:
+                r._backend.save_firings(r._session_id, records)
+            except Exception:
+                log.exception("from_json: re-persisting audit failed; swallowed")
         return r
 
     # ------------------------------------------------------------------
@@ -452,7 +510,7 @@ class Runner(_BaseRunner):
         else:
             self.status = RunStatus.RUNNING
         self._run_tick_end_hooks(self.tick_count - 1, firings)
-        self._persist_tick(firings)
+        self._persist_tick()
         return firings
 
     def run_until_idle(

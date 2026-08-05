@@ -411,3 +411,47 @@ def test_truncate_persistent_branch_direct(tmp_path):
     rs.truncate_after(5)                              # 幂等
     assert rs._audit_ceiling == 5
     assert rs._edges["A"] == [(3, "a2"), (5, "a3")]
+
+
+# --------------------------------------------------------------------------
+# A6: default backend lifecycle (D6) + runner-level dispatch
+# --------------------------------------------------------------------------
+
+def test_default_backend_temp_db_cleaned_up():
+    r = _reg()
+    rn = Runner(_loop_graph(r), r)      # no backend → temp SqliteBackend
+    rn.run_until_idle(max_ticks=50)
+    path = Path(rn._temp_db_path)
+    assert path.exists()                # lives during the run
+    del rn
+    gc.collect()
+    assert not path.exists()            # cleaned up with the Runner
+
+
+def test_explicit_backend_file_persists(tmp_path):
+    r = _reg()
+    be = SqliteBackend(tmp_path / "run.db")
+    rn = Runner(_loop_graph(r), r, backend=be, session_id="s1")
+    rn.run_until_idle(max_ticks=50)
+    del rn
+    gc.collect()
+    assert (tmp_path / "run.db").exists()
+
+
+def test_audit_full_from_backend():
+    r = _reg(limit=100)
+    rn = Runner(_loop_graph(r, 100), r)   # default temp backend
+    rn.run_until_idle(max_ticks=500)
+    assert len(rn.audit_log()) >= 100     # full trail read from SQLite
+    assert rn.run_state._records == []    # D4: no in-memory accumulation
+
+
+def test_firings_of_dispatch_backend_vs_window():
+    r = _reg(limit=5)
+    g = _loop_graph(r, 5)
+    rn = Runner(g, r)                      # persistent → full from backend
+    rn.run_until_idle(max_ticks=500)
+    assert len(rn.firings_of("A")) == 5
+    rn2 = Runner(g, r, backend=NullBackend())
+    rn2.run_until_idle(max_ticks=500)
+    assert len(rn2.firings_of("A")) <= 2   # window (D7)
