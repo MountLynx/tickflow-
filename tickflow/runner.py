@@ -267,19 +267,29 @@ class _BaseRunner:
     # Persistence helper
     # ------------------------------------------------------------------
 
-    def _persist_tick(self) -> None:
-        """Persist this tick's queued firings + snapshot to the backend."""
+    def _persist_tick(self, fired: list[str]) -> None:
+        """Persist this tick's queued firings + lightweight snapshot to the backend.
+
+        ``fired``: names of the nodes that fired this tick (history-review
+        trace; ``[]`` for an empty tick). The snapshot is saved at the
+        post-increment ``tick_count`` (per the backend protocol, snapshot
+        tick N = state after ticks 0..N-1), so snapshot tick N carries the
+        fired trace of tick N-1.
+        """
         # Defensive: __init__ guarantees a backend and session_id.
         if self._backend is None or self._session_id is None:
             return
         try:
             self.run_state.flush_firings()
             if self._persistent:
-                # Fast mode (NullBackend) skips per-tick snapshots: they embed
-                # the full in-memory audit (O(n^2) serialization over the run)
-                # and have no consumer in a zero-persistence run (D7).
-                # checkpoint()/rollback_to() still work via explicit labels.
-                self._backend.save_snapshot(self._session_id, self.tick_count, self.snapshot())
+                # Per-tick snapshots are lightweight (S1): records live in the
+                # firings table, so they are stripped -- but edges/state stay
+                # (a snapshot is self-contained and may be restored into a
+                # fresh runner with no history, S3-revised).
+                # Fast mode (NullBackend) skips per-tick snapshots (D7).
+                snap = self.snapshot(include_records=False)
+                snap["fired"] = list(fired)
+                self._backend.save_snapshot(self._session_id, self.tick_count, snap)
         except Exception:
             log.exception("backend persistence failed; swallowed")
 
@@ -287,9 +297,16 @@ class _BaseRunner:
     # Snapshot / restore
     # ------------------------------------------------------------------
 
-    def snapshot(self) -> dict:
-        """JSON-able snapshot of (marking, run_state, tick, status, fireable)."""
-        run_data = self.run_state.to_snapshot_data()
+    def snapshot(self, include_records: bool = True) -> dict:
+        """JSON-able snapshot of (marking, run_state, tick, status, fireable).
+
+        ``include_records`` is forwarded to
+        :meth:`RunState.to_snapshot_data` -- the persistent per-tick path
+        passes False (records live in the firings table, S1). The snapshot
+        is always self-contained otherwise (edges/state included, so it can
+        be restored into a fresh runner, S3-revised).
+        """
+        run_data = self.run_state.to_snapshot_data(include_records=include_records)
         return {
             "tick": self.tick_count,
             "marking": self.marking.to_json(),
@@ -521,7 +538,8 @@ class Runner(_BaseRunner):
         fireable = self.fireable()
         self._run_tick_start_hooks(self.tick_count, fireable)
         next_marking, firings, aborted = tick(
-            self.graph, self.marking, self.run_state, self.tick_count, self.registry
+            self.graph, self.marking, self.run_state, self.tick_count, self.registry,
+            fireable=fireable,
         )
         self.marking = next_marking
         for f in firings:
@@ -534,7 +552,7 @@ class Runner(_BaseRunner):
         else:
             self.status = RunStatus.RUNNING
         self._run_tick_end_hooks(self.tick_count - 1, firings)
-        self._persist_tick()
+        self._persist_tick([f.node for f in firings])
         return firings
 
     def run_until_idle(

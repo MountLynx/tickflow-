@@ -147,6 +147,13 @@ def _producers_on_distinct_branches(
 def check(graph: Graph) -> list[DeadlockSuggestion]:
     """Return all deadlock suggestions for ``graph``. Does not mutate."""
     out: list[DeadlockSuggestion] = []
+    # Branch reachability depends only on the splitter, not on the candidate
+    # AND-join m -- precompute once and look up (C3): O(S·(V+E)) instead of
+    # O(K·S·(V+E)).  Same-splitter suggestions share one branches dict (the
+    # only consumer, DeadlockSuggestion.msg, is read-only).
+    splitters: dict[str, dict[str, list[str]]] = {
+        b: _branches_of(graph, b) for b in graph.nodes if graph.is_xor_splitter(b)
+    }
     for m, node in graph.nodes.items():
         if node.join != "AND":
             continue
@@ -155,10 +162,7 @@ def check(graph: Graph) -> list[DeadlockSuggestion]:
             continue
         # Find any XOR-splitter B such that >=2 of M's producers lie on
         # distinct branches of B.
-        for b in graph.nodes:
-            if not graph.is_xor_splitter(b):
-                continue
-            branches = _branches_of(graph, b)
+        for b, branches in splitters.items():
             res = _producers_on_distinct_branches(graph, m, branches)
             if res is not None:
                 pair = res[0]

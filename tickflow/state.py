@@ -338,11 +338,15 @@ class RunState:
     # Snapshot data
     # ------------------------------------------------------------------
 
-    def to_snapshot_data(self) -> dict:
+    def to_snapshot_data(self, include_records: bool = True) -> dict:
         """JSON-able dict for ``Runner.snapshot()``.
 
-        ``edges`` + ``state`` are always included; ``records`` only when
-        ``keep_records=True``.
+        ``edges``/``fire_counts``/``state`` are always included -- snapshots
+        are self-contained (a snapshot may be restored into a fresh runner
+        with no history of its own, where truncate_after has nothing to
+        rebuild from; S3-revised). ``records`` only when ``keep_records=True``
+        and ``include_records``; the persistent per-tick path passes
+        ``include_records=False`` (records live in the firings table, S1).
         """
         data: dict[str, Any] = {
             "edges": {
@@ -353,7 +357,7 @@ class RunState:
             "state": {n: dict(s) for n, s in self._state.items()},
             "keep_records": self._keep_records,
         }
-        if self._keep_records:
+        if self._keep_records and include_records:
             data["records"] = [ns.to_json() for ns in self._records]
         return data
 

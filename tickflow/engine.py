@@ -134,17 +134,26 @@ def tick(
     run_state: RunState,
     t: int,
     registry: Registry,
+    fireable: list[str] | None = None,
 ) -> tuple[Marking, list[NodeState], bool]:
     """One synchronous tick. Returns ``(next_marking, firings, aborted)``.
 
     ``aborted`` is True iff some node returned an ``infrastructure`` Failure
     this tick -- callers (Runner) should then stop further ticks.
 
+    ``fireable``: precomputed fireable set for ``marking`` (the Runner already
+    computes it for tick-start hooks -- passing it avoids recomputing the
+    identical value, C1). Default None computes internally; direct callers
+    are unaffected. Caller responsibility: the list must match ``marking``
+    exactly and must not be mutated afterwards -- an inconsistent set
+    silently changes firing behaviour.
+
     Body/guard callables here are *synchronous*. For async bodies use
     :mod:`tickflow.async_runner` which mirrors this logic with ``await`` +
     ``asyncio.gather`` over the fireable set.
     """
-    fireable = [n for n in graph.nodes if _join_satisfied(graph, n, marking)]
+    if fireable is None:
+        fireable = [n for n in graph.nodes if _join_satisfied(graph, n, marking)]
     if not fireable:
         return marking.copy(), [], False
 

@@ -90,6 +90,13 @@ class Node:
 class Graph:
     nodes: dict[str, Node] = field(default_factory=dict)
     edges: list[Edge] = field(default_factory=list)
+    # Lazy adjacency index (C4): edges are append-only in this codebase
+    # (parser.py:183), so a length change invalidates; excluded from
+    # repr/eq (preserves legacy Graph semantics).
+    _adj: tuple[
+        dict[str, list[Edge]], dict[str, set[str]], dict[str, set[str]]
+    ] | None = field(default=None, repr=False, compare=False)
+    _adj_len: int = field(default=-1, repr=False, compare=False)
 
     @property
     def starts(self) -> list[str]:
@@ -97,15 +104,35 @@ class Graph:
 
     # --- adjacency helpers (used by engine + checker) ---------------------
 
+    def _ensure_adj(self) -> None:
+        """Rebuild the adjacency index (on first call or when the edge list
+        length changes)."""
+        if self._adj is not None and len(self.edges) == self._adj_len:
+            return
+        out: dict[str, list[Edge]] = {}
+        prod: dict[str, set[str]] = {}
+        cons: dict[str, set[str]] = {}
+        for e in self.edges:
+            out.setdefault(e.src, []).append(e)
+            prod.setdefault(e.dst, set()).add(e.src)
+            cons.setdefault(e.src, set()).add(e.dst)
+        self._adj = (out, prod, cons)
+        self._adj_len = len(self.edges)
+
     def producers(self, node: str) -> list[str]:
         """Distinct producer nodes with at least one edge into ``node``."""
-        return sorted({e.src for e in self.edges if e.dst == node})
+        self._ensure_adj()
+        return sorted(self._adj[1].get(node, ()))
 
     def out_edges(self, node: str) -> list[Edge]:
-        return [e for e in self.edges if e.src == node]
+        """Out-edges of ``node`` (returns a new list; safe for the caller
+        to hold)."""
+        self._ensure_adj()
+        return list(self._adj[0].get(node, ()))
 
     def consumers(self, node: str) -> list[str]:
-        return sorted({e.dst for e in self.edges if e.src == node})
+        self._ensure_adj()
+        return sorted(self._adj[2].get(node, ()))
 
     def is_xor_splitter(self, node: str) -> bool:
         """A node is an XOR-splitter if it has >=2 guarded out-edges."""

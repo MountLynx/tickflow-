@@ -521,6 +521,35 @@ class SqliteBackend:
             out.append((d["tick"], d.get("output")))
         return out
 
+    def latest_firings(self, session_id: str) -> list[dict]:
+        """The last firing per node (deduplicated by tick, keep-first --
+        same semantics as ``firings_of``), as JSON data rows sorted by node.
+
+        Monitoring queries (query_run_status) read latest outputs/state from
+        firings now that snapshots no longer carry edges/state (S3) --
+        O(firings in session), scoped by the idx_firings_node index.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT f.data FROM firings f
+                JOIN (
+                    SELECT node, MAX(tick) AS mt FROM (
+                        SELECT node, tick FROM firings
+                        WHERE session_id = ? GROUP BY node, tick
+                    ) GROUP BY node
+                ) l ON f.node = l.node AND f.tick = l.mt
+                WHERE f.session_id = ?
+                  AND f.id = (
+                      SELECT MIN(id) FROM firings
+                      WHERE session_id = ? AND node = f.node AND tick = f.tick
+                  )
+                ORDER BY f.node
+                """,
+                (session_id, session_id, session_id),
+            ).fetchall()
+        return [json.loads(r[0]) for r in rows]
+
     # -- checkpoints --------------------------------------------------------
 
     def save_checkpoint(self, session_id: str, label: str, snap: dict) -> None:
