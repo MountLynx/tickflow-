@@ -16,6 +16,8 @@ and replay cheap.
 ## Quick start
 
 ```bash
+pip install tickflow-py
+
 python -m tickflow run examples/counter_loop.txt -b examples/counter_loop_beh.py
 ```
 
