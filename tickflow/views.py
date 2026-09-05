@@ -217,7 +217,7 @@ class NodeView(_BindAccess, _LegacyNameAccess):
         return v
 
     def __repr__(self) -> str:
-        return f"NodeView(node={self._node!r}, inputs={list(self._resolved)})"
+        return f"{type(self).__name__}(node={self._node!r}, inputs={list(self._resolved)})"
 
 
 class GuardView(_BindAccess, _LegacyNameAccess):
