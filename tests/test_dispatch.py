@@ -129,3 +129,36 @@ def test_missing_survives_bind_resolution_end_to_end():
     assert seen["named"]["seed"] == "S"
     assert seen["args"] == (Missing, "S")
     assert seen["input"] == (Missing, "S")
+
+
+def test_field_overlays_stay_out_of_audit_and_view_collision_reads_pure():
+    r = Registry()
+    r.body("a", lambda: "A-out")
+    r.body("b", lambda: "B-out")
+
+    def cap(**kw):
+        return "ok"
+
+    r.body("cap", cap)
+    g = parse(
+        "[A]-->C\n[B]-->C\nA.body: a\nB.body: b\n"
+        "C.bind: {B: A, a: B}\nC.body: cap",
+        registry=r,
+    )
+    run = Runner(g, r)
+    run.run_until_idle(max_ticks=5)
+    rec = [f for f in run.audit_log() if f.node == "C"][-1]
+    # Audit records real producers only — no synthetic field keys, no clobber.
+    assert rec.inputs == {"A": "A-out", "B": "B-out"}
+
+
+def test_named_state_collision_is_loud_at_dispatch():
+    from tickflow.engine import prepare_body_call
+
+    r = Registry()
+
+    def f(*, state): ...
+
+    r.body("f", f)
+    with pytest.raises(TypeError, match="collides"):
+        prepare_body_call(r, "f", (("state", "S"),), (1,), {}, {}, "A")
