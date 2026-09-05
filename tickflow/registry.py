@@ -66,8 +66,16 @@ def _annotation_name(ann: Any) -> str | None:
 
 def classify(fn: Callable) -> Sig:
     """A single positional parameter named ``v``/``view`` (or annotated
-    ``NodeView``/``DictView``) is view mode; everything else is value mode."""
-    sig = inspect.signature(fn)
+    ``NodeView``/``DictView``) is view mode; everything else is value mode.
+
+    Non-introspectable callables (some builtins) and ``*args``-accepting
+    callables classify as value mode with ``arity=None`` — the engine calls
+    them with the bound values, and build-time arity validation skips them."""
+    try:
+        sig = inspect.signature(fn)
+    except ValueError:  # some C builtins expose no signature
+        return Sig(mode="value", arity=None, param_names=(), wants_state=False,
+                   is_async=inspect.iscoroutinefunction(fn))
     params = list(sig.parameters.values())
     positional = [
         p for p in params
@@ -75,6 +83,9 @@ def classify(fn: Callable) -> Sig:
                       inspect.Parameter.POSITIONAL_OR_KEYWORD)
     ]
     kwonly = [p for p in params if p.kind == inspect.Parameter.KEYWORD_ONLY]
+    has_var_positional = any(
+        p.kind == inspect.Parameter.VAR_POSITIONAL for p in params
+    )
     is_async = inspect.iscoroutinefunction(fn)
     if (
         len(positional) == 1 and not kwonly
@@ -86,7 +97,7 @@ def classify(fn: Callable) -> Sig:
                    is_async=is_async)
     return Sig(
         mode="value",
-        arity=len(positional),
+        arity=None if has_var_positional else len(positional),
         param_names=tuple(p.name for p in positional),
         wants_state=any(p.name == "state" for p in kwonly),
         is_async=is_async,

@@ -69,3 +69,47 @@ def test_registry_records_and_serves_sigs():
         r.body_sig("nope")
     with pytest.raises(KeyError):
         r.guard_sig("nope")
+
+
+def test_value_wants_state_async():
+    async def f(a, *, state): ...
+    s = classify(f)
+    assert s.wants_state is True and s.is_async is True
+
+
+def test_non_introspectable_callable_falls_back():
+    import functools
+
+    s = classify(functools.reduce)
+    assert s.mode == "value"
+    assert s.arity is None  # unknown -> build-time arity checks skip
+
+
+def test_var_positional_arity_unknown():
+    def f(*values): ...
+    s = classify(f)
+    assert s.mode == "value"
+    assert s.arity is None
+
+
+def test_future_annotations_module_shapes():
+    """PEP 563 modules store annotations as strings — the exact SpecModule shape."""
+    import textwrap
+
+    ns: dict = {}
+    exec(
+        textwrap.dedent(
+            """
+            from __future__ import annotations
+            from tickflow.views import DictView
+
+            def bare(view: DictView): ...
+            def quoted(view: "DictView"): ...
+            def dotted(v: "tickflow.views.DictView"): ...
+            """
+        ),
+        ns,
+    )
+    assert classify(ns["bare"]).mode == "view"
+    assert classify(ns["quoted"]).mode == "view"
+    assert classify(ns["dotted"]).mode == "view"
