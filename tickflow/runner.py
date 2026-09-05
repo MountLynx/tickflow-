@@ -101,7 +101,9 @@ def _cleanup_temp_db(backend: SqliteBackend, path: str) -> None:
             log.exception("unlink %r failed; swallowed", p)
 
 
-def _validate_registry_for_graph(graph: Graph, registry: Registry) -> None:
+def _validate_registry_for_graph(
+    graph: Graph, registry: Registry, warn_stacklevel: int = 4
+) -> None:
     """Raise ValueError if ``registry`` is missing any body or guard name
     referenced by ``graph``, or if any signature contradicts the graph's bind
     declarations (E1 arity / E2 named fields / E3 guard arity). Warn (W1) on
@@ -117,10 +119,12 @@ def _validate_registry_for_graph(graph: Graph, registry: Registry) -> None:
         raise ValueError(
             "registry missing required entries:\n  " + "\n  ".join(missing)
         )
-    _validate_bind_signatures(graph, registry)
+    _validate_bind_signatures(graph, registry, warn_stacklevel)
 
 
-def _validate_bind_signatures(graph: Graph, registry: Registry) -> None:
+def _validate_bind_signatures(
+    graph: Graph, registry: Registry, warn_stacklevel: int = 4
+) -> None:
     """Strict-defaults contract (checked at Runner construction):
 
     - E1 (positional) requires the body's positional arity to EQUAL the bind
@@ -141,10 +145,20 @@ def _validate_bind_signatures(graph: Graph, registry: Registry) -> None:
         if sig.mode == "value":
             if is_named:
                 if set(sig.param_names) != set(fields):
+                    # Keyword-only params (other than `state`) never appear in
+                    # param_names — a kwonly-only body gets an empty list here,
+                    # so point the author at the actual rule.
+                    hint = ""
+                    if not sig.param_names and fields:
+                        hint = (
+                            " (named binds bind positional parameters; "
+                            "keyword-only parameters other than `state` are "
+                            "not bindable)"
+                        )
                     raise ValueError(
                         f"node {node.name!r}: body {node.body!r} parameters "
                         f"{list(sig.param_names)} do not match named bind fields "
-                        f"{list(fields)}"
+                        f"{list(fields)}{hint}"
                     )
             else:
                 # arity=None = unknown (*args bodies / non-introspectable
@@ -153,7 +167,10 @@ def _validate_bind_signatures(graph: Graph, registry: Registry) -> None:
                     raise ValueError(
                         f"node {node.name!r}: body {node.body!r} expects "
                         f"{sig.arity} parameter(s), bind declares "
-                        f"{len(entries)} input(s)"
+                        f"{len(entries)} input(s) — a body's positional "
+                        f"parameters must match its bind exactly (defaulted "
+                        f"or extra parameters are not allowed); change the "
+                        f"body signature or the bind"
                     )
                 if node.bind is None and len(entries) >= 2:
                     warnings.warn(
@@ -162,10 +179,10 @@ def _validate_bind_signatures(graph: Graph, registry: Registry) -> None:
                         f"inputs key order — declare {node.name}.bind: [...] "
                         f"to pin it against renames",
                         UserWarning,
-                        # Frame chain: warn-site -> _validate_bind_signatures
-                        # -> _validate_registry_for_graph -> _validate_registry
-                        # -> __init__ -> user's Runner(...) line.
-                        stacklevel=5,
+                        # Depth depends on the entry path; callers pass the
+                        # right one (construction: __init__ adds two frames
+                        # over set_registry/remap_graph).
+                        stacklevel=warn_stacklevel,
                     )
     for edge in graph.edges:
         if edge.guard is None:
@@ -257,7 +274,10 @@ class _BaseRunner:
     ) -> None:
         self.graph = graph
         self.registry = registry if registry is not None else _default_registry
-        self._validate_registry(self.registry)
+        # warn_stacklevel=6: warn -> _validate_bind_signatures ->
+        # _validate_registry_for_graph -> _validate_registry ->
+        # _BaseRunner.__init__ -> Runner/AsyncRunner.__init__ -> caller.
+        self._validate_registry(self.registry, warn_stacklevel=6)
         self.marking: Marking = bootstrap(graph)
         if backend is None:
             # D6: default = temp SqliteBackend, cleaned up with the Runner.
@@ -449,12 +469,15 @@ class _BaseRunner:
     # Registry swap
     # ------------------------------------------------------------------
 
-    def _validate_registry(self, registry: Registry) -> None:
-        _validate_registry_for_graph(self.graph, registry)
+    def _validate_registry(self, registry: Registry, warn_stacklevel: int = 4) -> None:
+        _validate_registry_for_graph(self.graph, registry, warn_stacklevel)
 
     def set_registry(self, registry: Registry) -> None:
         """Replace :attr:`registry` with a new Registry instance."""
-        _validate_registry_for_graph(self.graph, registry)
+        # warn_stacklevel=5: warn -> _validate_bind_signatures ->
+        # _validate_registry_for_graph -> _validate_registry -> set_registry
+        # -> caller.
+        _validate_registry_for_graph(self.graph, registry, warn_stacklevel=5)
         self.registry = registry
 
     # ------------------------------------------------------------------

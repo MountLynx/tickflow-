@@ -110,3 +110,24 @@ def test_w1_fires_on_async_runner_too():
     g = parse("[A]-->C\n[B]-->C\nC.body: pos", registry=r)
     with pytest.warns(UserWarning, match="auto-bind"):
         AsyncRunner(g, r)
+
+
+def test_w1_stacklevel_points_at_caller():
+    # W1 must attribute to the user's Runner(...) line, not tickflow internals.
+    r = Registry()
+    r.body("pos", lambda a, b: a + b)
+    g = parse("[A]-->C\n[B]-->C\nC.body: pos", registry=r)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        Runner(g, r)
+    w1 = [x for x in rec if "auto-bind" in str(x.message)]
+    assert w1, "W1 should fire"
+    assert w1[0].filename == __file__
+
+
+def test_e2_kwonly_body_message_is_actionable():
+    r = Registry()
+    r.body("kwo", lambda *, a, b: a)
+    g = parse("[A]-->C\n[B]-->C\nC.bind: {a: A, b: B}\nC.body: kwo", registry=r)
+    with pytest.raises(ValueError, match="keyword-only"):
+        Runner(g, r)

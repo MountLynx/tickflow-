@@ -29,8 +29,10 @@ registration time (:func:`classify`) and recorded as a :class:`Sig`.
 
 Identity body
 -------------
-A node with ``body is None`` echoes its single declared input (or ``None`` if
-it has no declared inputs) -- handy for pure-routing nodes like ``Merge``.
+A node with ``body is None`` echoes its first bound input (``None`` if it has
+no bound inputs) -- handy for pure-routing nodes like ``Merge``. With an
+explicit reordered bind the echo follows the bind: the first *bind* entry,
+which may differ from the first declared input.
 """
 
 from __future__ import annotations
