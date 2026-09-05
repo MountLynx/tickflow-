@@ -1148,9 +1148,13 @@ def bind_entries(node: Node) -> tuple[tuple[str | None, str], ...]:
 
 def _prepare_fire(
     graph: Graph, node: str, run_state: RunState, t: int, registry: Registry,
-) -> tuple[dict[str, Resolved], tuple[tuple[str | None, str], ...], tuple]:
+) -> tuple[dict[str, Resolved], dict[str, Resolved], tuple[tuple[str | None, str], ...], tuple]:
     """Shared Phase-A prep for the sync and async engines: resolve declared
     inputs, derive bind entries, assemble the positional values tuple.
+
+    Returns ``(legacy, resolved, entries, values)``: ``resolved`` maps real
+    producers only (feeds the NodeState audit); ``legacy`` additionally
+    overlays bind field names for the view's deprecated by-name access.
 
     Missing fidelity: elements pass ``run_state.resolve`` results through
     verbatim — a producer that has not fired yet contributes ``Missing``, and
@@ -1175,12 +1179,15 @@ def _prepare_fire(
             f"node {node!r}: assembled {len(values)} values for "
             f"{len(entries)} bind entries"
         )
-    # Named field overlays for legacy by-name access (field wins over a
-    # colliding producer key).
+    # Legacy by-name key space for the view: field names overlay producer
+    # entries (field wins on collision). Overlays READ from the pure resolved
+    # map so colliding fields never poison each other, and stay OUT of
+    # ``resolved`` so NodeState.inputs audits real producers only.
+    legacy = dict(resolved)
     for f, prod in entries:
         if f is not None:
-            resolved[f] = resolved[prod]
-    return resolved, entries, values
+            legacy[f] = resolved[prod]
+    return legacy, resolved, entries, values
 
 
 def prepare_body_call(
@@ -1189,12 +1196,17 @@ def prepare_body_call(
     entries: tuple[tuple[str | None, str], ...],
     values: tuple,
     state_view: Any,
-    resolved: dict[str, Resolved],
+    legacy: dict[str, Resolved],
     node: str,
 ) -> tuple[Any, tuple, dict]:
     """Resolve the call shape for a node body from its registered signature:
     value mode (positional args / named kwargs / keyword-only ``state`` tail)
-    or view mode (one NodeView). Returns ``(fn, args, kwargs)``."""
+    or view mode (one NodeView over ``legacy`` — field names overlay producer
+    keys). Returns ``(fn, args, kwargs)``."""
+    if len(values) != len(entries):  # pragma: no cover — _prepare_fire guarantees
+        raise RuntimeError(
+            f"node {node!r}: {len(values)} values for {len(entries)} bind entries"
+        )
     body = registry.get_body(body_name)
     sig = registry.body_sig(body_name)
     is_named = any(f is not None for f, _ in entries)
@@ -1202,6 +1214,11 @@ def prepare_body_call(
         if is_named:
             kwargs = {f: v for (f, _), v in zip(entries, values)}
             if sig.wants_state:
+                if "state" in kwargs:
+                    raise TypeError(
+                        f"node {node!r}: bind field 'state' collides with the "
+                        f"body's keyword-only state parameter"
+                    )
                 kwargs["state"] = state_view
             return body, (), kwargs
         if sig.wants_state:
@@ -1209,7 +1226,7 @@ def prepare_body_call(
         return body, values, {}
     view = NodeView(
         node=node, fields=entries, values=values,
-        state=state_view, resolved=resolved,
+        state=state_view, resolved=legacy,
     )
     return body, (view,), {}
 ```
@@ -1218,7 +1235,7 @@ def prepare_body_call(
 
 ```python
     for node in fireable:
-        resolved, entries, values = _prepare_fire(graph, node, run_state, t, registry)
+        legacy, resolved, entries, values = _prepare_fire(graph, node, run_state, t, registry)
         initial_state = run_state.mutable_state(node)
         state_view = _NodeStateView(initial_state)
         body_name = graph.nodes[node].body
@@ -1227,12 +1244,12 @@ def prepare_body_call(
             output = values[0] if values else None
         else:
             fn, args, kwargs = prepare_body_call(
-                registry, body_name, entries, values, state_view, resolved, node,
+                registry, body_name, entries, values, state_view, legacy, node,
             )
             output = fn(*args, **kwargs)
 ```
 
-Phase A 其余（Failure 判定、NodeState 组装、record、slot 消费）不动。`registry.py` 的 `_identity_body` 与 `get_body(None)` 路径保留（API 兼容），但引擎对 `body is None` 已不再走它——在 `_identity_body` docstring 加一句 "The engine inlines identity handling; kept for direct callers."
+Phase A 其余（Failure 判定、NodeState 组装、record、slot 消费）不动；`NodeState.inputs` 仍读 `resolved`——现在它是纯净的（仅真实生产者；字段覆盖只存在于视图用的 `legacy` 中，绝不进审计）。`registry.py` 的 `_identity_body` 与 `get_body(None)` 路径保留（API 兼容），但引擎对 `body is None` 已不再走它——在 `_identity_body` docstring 加一句 "The engine inlines identity handling; kept for direct callers."
 
 - [ ] **Step 4: 跑测试确认通过 + 全量回归**
 
@@ -1577,7 +1594,7 @@ from .engine import (
 
 ```python
     async def _fire(node: str) -> NodeState:
-        resolved, entries, values = _prepare_fire(graph, node, run_state, t, registry)
+        legacy, resolved, entries, values = _prepare_fire(graph, node, run_state, t, registry)
         initial_state = run_state.mutable_state(node)
         state_view = _NodeStateView(initial_state)
         body_name = graph.nodes[node].body
@@ -1585,7 +1602,7 @@ from .engine import (
             output = values[0] if values else None
         else:
             fn, args, kwargs = prepare_body_call(
-                registry, body_name, entries, values, state_view, resolved, node,
+                registry, body_name, entries, values, state_view, legacy, node,
             )
             output = await _maybe_await(fn, *args, **kwargs)
         is_fail = isinstance(output, Failure)
