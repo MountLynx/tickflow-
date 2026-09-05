@@ -69,6 +69,54 @@ class InputPolicy:
         return cls(kind="index", k=k)
 
 
+@dataclass(frozen=True)
+class Bind:
+    """Normalized bind declaration: ordered ``(field, producer)`` entries.
+
+    ``field`` is ``None`` for positional (anonymous) entries. A Bind is either
+    all-positional or all-named; mixing is rejected here so the engine never
+    sees an ambiguous declaration. Programmatic graph builders pass
+    ``Bind.named({...})``; the parser produces the same via text syntax.
+    """
+
+    entries: tuple[tuple[str | None, str], ...]
+
+    def __post_init__(self) -> None:
+        if not self.entries:
+            raise ValueError("bind must declare at least one producer")
+        fields = [f for f, _ in self.entries if f is not None]
+        if fields and len(fields) != len(self.entries):
+            raise ValueError("bind cannot mix positional and named entries")
+        if len(set(fields)) != len(fields):
+            raise ValueError(f"duplicate bind fields: {fields}")
+        prods = [p for _, p in self.entries]
+        if len(set(prods)) != len(prods):
+            raise ValueError(f"duplicate bind producers: {prods}")
+
+    @classmethod
+    def positional(cls, producers) -> "Bind":
+        """Anonymous positional bind: parameter i <- producers[i]."""
+        return cls(entries=tuple((None, p) for p in producers))
+
+    @classmethod
+    def named(cls, mapping) -> "Bind":
+        """Named bind: field -> producer (dict or iterable of pairs)."""
+        items = mapping.items() if hasattr(mapping, "items") else mapping
+        return cls(entries=tuple((f, p) for f, p in items))
+
+    @property
+    def fields(self) -> tuple[str, ...]:
+        return tuple(f for f, _ in self.entries if f is not None)
+
+    @property
+    def producers(self) -> tuple[str, ...]:
+        return tuple(p for _, p in self.entries)
+
+    @property
+    def is_named(self) -> bool:
+        return bool(self.fields)
+
+
 @dataclass
 class Edge:
     src: str
@@ -84,6 +132,9 @@ class Node:
     body: str | None = None  # registry key; None => identity (echo inputs)
     # producer name -> how this node reads that producer's history
     inputs: dict[str, InputPolicy] = field(default_factory=dict)
+    # ordered bind declaration: which producer feeds which parameter/field.
+    # None = auto-bind from the ``inputs`` key order (see engine.bind_entries).
+    bind: Bind | None = None
 
 
 @dataclass
@@ -151,6 +202,7 @@ class Graph:
                 join=node.join,
                 body=node.body,
                 inputs={k: InputPolicy(kind=v.kind, k=v.k) for k, v in node.inputs.items()},
+                bind=node.bind,  # frozen object, safe to share
             )
         g.edges = [Edge(src=e.src, dst=e.dst, guard=e.guard) for e in self.edges]
         return g
@@ -173,6 +225,10 @@ class Graph:
                         k: {"kind": v.kind, "k": v.k}
                         for k, v in n.inputs.items()
                     },
+                    "bind": (
+                        None if n.bind is None
+                        else {"fields": list(n.bind.fields), "producers": list(n.bind.producers)}
+                    ),
                     "producers": self.producers(name),
                 }
                 for name, n in self.nodes.items()
