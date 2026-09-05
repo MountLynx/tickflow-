@@ -1010,7 +1010,7 @@ def test_value_mode_named_bind_kwargs():
 
     r.body("sum", combine)
     g = parse(
-        "[A]-->C\n[B]-->C\nC.bind: {a: A, b: B}\nC.body: sum", registry=r
+        "[A]-->C\nA.body: a\n[B]-->C\nB.body: b\nC.bind: {a: A, b: B}\nC.body: sum", registry=r
     )
     run = Runner(g, r)
     run.run_until_idle(max_ticks=5)
@@ -1102,7 +1102,7 @@ def test_missing_survives_bind_resolution_end_to_end():
     r.body("loop_body", loop_body)
     r.body("sink_body", sink_body)
     g = parse(
-        "[S]-->A\nA-->sink\nsink-->A\nA.join: OR\n"
+        "[S]-->A\nA-->sink\nsink-->A\nA.join: OR\nS.body: seed_body\n"
         "A.bind: {prev: sink, seed: S}\nA.body: loop_body\nsink.body: sink_body",
         registry=r,
     )
@@ -1517,7 +1517,7 @@ def test_async_view_mode_and_missing():
     r.body("loop_body", loop_body)
     r.body("sink_body", sink_body)
     g = parse(
-        "[S]-->A\nA-->sink\nsink-->A\nA.join: OR\n"
+        "[S]-->A\nA-->sink\nsink-->A\nA.join: OR\nS.body: seed_body\n"
         "A.bind: {prev: sink, seed: S}\nA.body: loop_body\nsink.body: sink_body",
         registry=r,
     )
