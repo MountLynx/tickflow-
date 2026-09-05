@@ -135,8 +135,12 @@ def test_field_overlays_stay_out_of_audit_and_view_collision_reads_pure():
     r = Registry()
     r.body("a", lambda: "A-out")
     r.body("b", lambda: "B-out")
+    seen = {}
 
-    def cap(**kw):
+    def cap(v):
+        with pytest.warns(DeprecationWarning):
+            seen["B_via_name"] = v["B"].value   # field 'B' wins -> A-out
+            seen["named"] = dict(v.named)
         return "ok"
 
     r.body("cap", cap)
@@ -150,6 +154,9 @@ def test_field_overlays_stay_out_of_audit_and_view_collision_reads_pure():
     rec = [f for f in run.audit_log() if f.node == "C"][-1]
     # Audit records real producers only — no synthetic field keys, no clobber.
     assert rec.inputs == {"A": "A-out", "B": "B-out"}
+    # View legacy keyspace: field 'B' wins the collision (design §4.3).
+    assert seen["B_via_name"] == "A-out"
+    assert seen["named"] == {"B": "A-out", "a": "B-out"}
 
 
 def test_named_state_collision_is_loud_at_dispatch():

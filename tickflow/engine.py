@@ -45,9 +45,9 @@ import logging
 from .ir import Graph, Failure, Node, InputPolicy
 from .registry import Registry
 from .state import NodeState, RunState, _jsonable
-# ``DictView`` is still the guard-evaluation view (_guard_view); Task 6 owns
-# moving guards to GuardView. ``GuardView``/``_ReadOnlyStateView`` are the
-# same migration's targets, imported here ahead of that change.
+# Guard adjudication uses GuardView + _ReadOnlyStateView; DictView survives
+# only inside _guard_view, the legacy all-nodes view the (unmigrated) async
+# engine still imports (Task 7 deletes it).
 from .views import Resolved, NodeView, GuardView, _ReadOnlyStateView, DictView
 
 log = logging.getLogger(__name__)
@@ -334,15 +334,67 @@ def tick(
             elif e.guard is None:
                 v = True
             else:
-                v = bool(registry.get_guard(e.guard)(
-                    _guard_view(
-                        graph, e.src, f.output, run_state, t, registry,
-                    )
-                ))
+                gfn, gargs, gkwargs = prepare_guard_call(
+                    registry, e.guard, graph, e.src, f.output, run_state, t,
+                )
+                v = bool(gfn(*gargs, **gkwargs))
             m_next.slots[(e.dst, e.src)] = v
             f.edges_fired.append((e.dst, e.guard, v))
 
     return m_next, firings, aborted
+
+
+def _guard_node_view(
+    graph: Graph,
+    src: str,
+    src_output: Any,
+    run_state: RunState,
+    t: int,
+) -> GuardView:
+    """Build the adjudication view for a guard on ``src--|g|-->dst``: the
+    firing node's current-tick output plus that node's bind-declared inputs,
+    resolved with the same policies the body just consumed. Nothing else is
+    reachable — guards cannot read undeclared nodes."""
+    src_node = graph.nodes[src]
+    entries = bind_entries(src_node)
+    resolved: dict[str, Resolved] = {}
+    values: list[Any] = []
+    for f, prod in entries:
+        policy = src_node.inputs.get(prod) or InputPolicy.latest()
+        r = Resolved(
+            value=run_state.resolve(prod, policy.kind, policy.k, t), k=policy.k,
+        )
+        resolved[prod] = r
+        if f is not None:
+            resolved[f] = r
+        values.append(r.value)
+    # The src name maps to the output being adjudicated; it wins over any
+    # colliding key so legacy ``view[src]`` keeps meaning "current output".
+    resolved[src] = Resolved(value=src_output, k=None)
+    return GuardView(
+        src=src, output=src_output, fields=entries,
+        values=tuple(values),
+        state=_ReadOnlyStateView(run_state.mutable_state(src)),
+        resolved=resolved,
+    )
+
+
+def prepare_guard_call(
+    registry: Registry,
+    guard_name: str,
+    graph: Graph,
+    src: str,
+    src_output: Any,
+    run_state: RunState,
+    t: int,
+) -> tuple[Any, tuple, dict]:
+    """Resolve the guard call shape for edge ``src--|guard|-->dst``
+    (sync + async shared)."""
+    guard = registry.get_guard(guard_name)
+    sig = registry.guard_sig(guard_name)
+    if sig.mode == "value":
+        return guard, (src_output,), {}
+    return guard, (_guard_node_view(graph, src, src_output, run_state, t),), {}
 
 
 def _guard_view(
@@ -356,6 +408,9 @@ def _guard_view(
     """Build a view for guard evaluation where the firing node ``src``'s
     *current-tick* output is visible under its own name, and any other
     producer the guard may reference resolves to latest_before(t).
+
+    Legacy all-nodes view; only the (unmigrated) async engine still uses it.
+    Removed in the next task.
 
     The firing node's own mutable state (just recorded in run_state) is
     exposed via ``view.state`` so a guard like "retry under max" can read
