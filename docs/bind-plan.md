@@ -1719,6 +1719,15 @@ def test_view_mode_body_no_w1_and_no_arity_check():
         warnings.simplefilter("always")
         Runner(g, r)
     assert not any("auto-bind" in str(x.message) for x in rec)
+
+
+def test_e1_skips_arity_unknown_var_args():
+    # classify() records arity=None for *args bodies and non-introspectable
+    # callables; E1 must skip them (the engine calls them with *values).
+    r = Registry()
+    r.body("var", lambda *a: len(a))
+    g = parse("[A]-->C\n[B]-->C\nC.body: var", registry=r)
+    Runner(g, r)  # no raise (a W1 auto-bind warning may fire; that's fine)
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -1770,7 +1779,9 @@ def _validate_bind_signatures(graph: Graph, registry: Registry) -> None:
                         f"{list(fields)}"
                     )
             else:
-                if sig.arity != len(entries):
+                # arity=None = unknown (*args bodies / non-introspectable
+                # callables) -> skip, the engine calls them with *values.
+                if sig.arity is not None and sig.arity != len(entries):
                     raise ValueError(
                         f"node {node.name!r}: body {node.body!r} expects "
                         f"{sig.arity} parameter(s), bind declares "
