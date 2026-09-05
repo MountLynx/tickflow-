@@ -325,7 +325,7 @@ class _ReadOnlyStateView:
 
 class DictView(NodeView):
     """Deprecated legacy constructor shim: ``DictView(inputs, state, node)``
-    keeps existing construction sites (tests, SpecModule's translator) working
+    keeps legacy construction sites (tests, pre-bind engine hosts) working
     on top of NodeView. Prefer NodeView / value mode."""
 
     def __init__(self, inputs: dict[str, Resolved] | None, state: Any = None,

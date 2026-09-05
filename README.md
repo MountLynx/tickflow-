@@ -1,5 +1,7 @@
 # tickflow
 
+English | [简体中文](README.zh.md)
+
 A small Petri-style workflow control framework for building short, auditable,
 reversible flows. You describe the graph in a mermaid-like syntax; the engine
 runs it as synchronous Petri-net *steps* over a boolean slot marking, with
@@ -73,27 +75,30 @@ with no qualifying fire yet yields the `Missing` sentinel (falsy).
 
 ### RunState — single source of truth
 
-All runtime state lives in `RunState`, organized in three internal layers
+All runtime state lives in `RunState`, organized in four internal layers
 with distinct responsibilities:
 
 ```
 RunState
-    _edges   dict[node, list[(tick, output)]]    windowed (last 2 fires/node), for resolve()
-    _state   dict[node, dict]                    current mutable state per node, O(1)
-    _records list[NodeState]                     audit in memory: keep_records AND no persistent backend
+    _edges       dict[node, list[(tick, output)]]    windowed (last 2 fires/node), for resolve()
+    _fire_counts dict[node, int]                     firing ordinals — map window entries back to A[k]
+    _state       dict[node, dict]                    current mutable state per node, O(1)
+    _records     list[NodeState]                     audit in memory: keep_records AND no persistent backend
 ```
 
 - **`_edges`** — windowed fast-lookup index for `resolve()`: only the last two
   firings per node stay in memory; older firings live in the backend. Memory
   usage is O(nodes × 2 × output size), independent of how many times a node fired.
+- **`_fire_counts`** — per-node firing counters; they map window entries back
+  to their `A[k]` ordinals, so index reads stay correct with a windowed index.
 - **`_state`** — current mutable state per node (what bodies write via
-  `view.state`). Always maintained, O(1) access. Replaces the old
-  `Marking.node_state`.
+  `view.state`). Always maintained, O(1) access.
 - **`_records`** — full `NodeState` records in memory. Maintained only when
   `keep_records=True` **and** no persistent backend. With a backend (the
-  default), the audit lives on disk and `audit()` queries it.
+  default), firings are batch-flushed to it every tick and `audit()` queries
+  it on demand.
 
-Derived artefacts are extracted from these three layers — or from the
+Derived artefacts are extracted from these layers — or from the
 backend when one is attached:
 
 | Query | Source (persistent backend) | Source (NullBackend) |
@@ -102,7 +107,7 @@ backend when one is attached:
 | `resolve(index)` — k-th fire | window first, then `backend.firing_at` | window; outside → `Missing` |
 | `firings_of()` — output history | `backend.firings_of` (full) | `_edges` window |
 | `audit()` — full audit log | `backend.list_firings` | `_records` (keep_records) |
-| `to_snapshot_data()` — snapshot | window + state (+ `fire_counts`) | same |
+| `to_snapshot_data()` — snapshot | window + state + `fire_counts` (+ `records` if auditing) | same |
 
 ### NodeState — one firing, all data
 
@@ -130,15 +135,20 @@ rn = Runner(graph, registry, keep_records=False)
 ```
 
 When `keep_records=False`, `_records` is not populated — saving memory — but
-`_edges` and `_state` are still maintained. Input resolution and node mutable
-state work correctly regardless of this switch. The snapshot omits the
-`"records"` key. Backend persistence (firings, snapshots) is unaffected.
+`_edges`, `_fire_counts` and `_state` are still maintained. Input resolution
+and node mutable state work correctly regardless of this switch. The snapshot
+omits the `"records"` key. Backend persistence (firings, snapshots) is
+unaffected.
 
 By default (`backend=None`) the Runner creates a temporary SQLite backend in
 the system temp dir, auto-generates a `session_id`, and removes the database
 file when the Runner is garbage-collected — so persistence, audit, checkpoints
 and `A[k]` index reads work out of the box. Pass `NullBackend()` explicitly
 for a zero-I/O in-memory run, or a concrete backend for a persistent one.
+`NullBackend` also enables **fast mode**: per-tick snapshot persistence is
+skipped entirely (the audit serialisation it implies was O(n²) over long
+runs), at the cost of no cold history — `A[k]` reads outside the window and
+full `firings_of()` degrade to `Missing` / the 2-entry window.
 
 ## Semantics
 
@@ -241,18 +251,32 @@ rn.run_until_idle(max_ticks=100)                  # replay (identical if bodies 
 
 - **`snapshot()`** returns `{"tick", "marking", "run_state", "status",
   "cancel_reason", "fireable"}` — pure JSON. `run_state` contains `edges`
-  (windowed output index), `state` (mutable state per node), and `records`
-  (in-memory audit, populated only when `keep_records=True` and no backend).
+  (windowed output index), `fire_counts` (per-node firing ordinals), `state`
+  (mutable state per node), and `records` (in-memory audit — included only
+  when `keep_records=True`; pass `snapshot(include_records=False)` to strip).
+  Snapshots are **self-contained**: edges/state always travel with the
+  snapshot, so one restores cleanly into a fresh Runner with no history of
+  its own.
 - **`restore(snap)`** rewinds: sets tick/marking/run_state/status from `snap`.
-  RunState records with `tick >= snap["tick"]` are dropped. A restored
+  In-memory records with `tick >= snap["tick"]` are dropped; with a persistent
+  backend the on-disk firings are retained as audit history while the window,
+  fire counts and node state rebuild from the persisted rows. A restored
   terminal status (ABORTED/CANCELLED/FAILED) is reset to IDLE so the run can
-  resume.
+  resume. Replayed firings are deduplicated by `(tick, node)` (keep-first) in
+  `audit()`, so restore-then-replay never double-counts.
 - **`pause_at={n}`** stops at the tick boundary before tick `n` — no
   half-fired state to save.
 - **Branching / what-if**: `copy.deepcopy(snap)` and `restore` into separate
-  Runners. The library doesn't maintain a timeline forest.
+  Runners. The library doesn't maintain a timeline forest. With a persistent
+  backend the audit lives on disk, so a branch built from a deep-copied
+  snapshot has an empty `audit_log()` until it fires again — execution
+  semantics (window, state, `A[k]` via the backend) are intact. For an
+  audit-preserving fork use `to_json()` / `from_json()`, which carry the full
+  trail.
 - **`to_json()` / `from_json()`** serialize the full state as a single JSON
-  object. The graph and registry are *not* stored — supply them on reload.
+  object; with a persistent backend the audit trail is re-embedded so a
+  roundtrip carries it. The graph and registry are *not* stored — supply them
+  on reload.
 
 **Body purity**: bodies should be pure functions of their input view (state
 writes aside). If a body is non-pure, restore-then-replay may diverge from the
@@ -350,8 +374,12 @@ The `AsyncRunner` accepts async hooks (`async def`).
 ## Persistence backend
 
 A `Runner` constructed with `backend=...` and `session_id=...` persists,
-at the end of every tick: each `NodeState` (the process record) and a full
-snapshot at the new tick index.
+at the end of every tick: each `NodeState` (the process record, batch-flushed
+once per tick) and a lightweight snapshot at the new tick index. The persisted
+snapshot strips `records` (they live in the backend's firings table) but keeps
+`edges`/`state` — it stays self-contained — and adds a `fired` trace listing
+the nodes that fired that tick. Fast mode (`NullBackend`) skips per-tick
+snapshot persistence entirely.
 
 ```python
 from tickflow import JsonBackend
@@ -367,13 +395,18 @@ rn2.restore(snap)
 ```
 
 - **`Backend`** (Protocol): `save_snapshot` / `load_snapshot` / `latest_tick`
-  / `list_snapshots` / `save_firing` / `list_firings` / `save_checkpoint` /
-  `list_checkpoints` / `load_checkpoint`.
+  / `list_snapshots` / `save_firing` / `save_firings` / `list_firings` /
+  `firing_at` / `firings_of` / `save_checkpoint` / `list_checkpoints` /
+  `load_checkpoint`.
 - **`JsonBackend(storage_dir)`**: one dir per session, `tick_<N>.json` +
-  `firings.jsonl` + `checkpoints.json`. Default; human-inspectable.
-- **`SqliteBackend(db_path)`**: single SQLite file with `snapshots` /
-  `firings` / `checkpoints` tables. Better for high tick-throughput.
-- **`NullBackend`**: in-memory, for tests.
+  `firings.jsonl` + `checkpoints.json`. Human-inspectable.
+- **`SqliteBackend(db_path)`**: single SQLite file (WAL) with `snapshots` /
+  `firings` / `checkpoints` tables. Better for high tick-throughput; writes
+  are serialized behind an internal lock, so one instance is safe to share
+  across threads. This is the default (temp file, auto-cleaned).
+- **`NullBackend`**: in-memory fast mode — no disk I/O, no per-tick
+  snapshots, no cold history (`A[k]` outside the window degrades to
+  `Missing`). Good for tests and hot loops.
 
 ### Named checkpoints
 
@@ -406,6 +439,11 @@ For graphs whose bodies do IO (LLM calls, HTTP, DB), use `AsyncRunner`.
 Bodies and guards may be `async def`; fireable nodes fire **concurrently**
 within a tick via `asyncio.gather`. Semantics are identical to the sync
 `Runner`.
+
+Since the default backend is a temp SQLite file, an `AsyncRunner` created
+without an explicit `backend=` performs a small synchronous SQLite write at
+the end of every tick — fine when LLM latency dominates, but pass
+`NullBackend()` for zero-I/O async runs.
 
 ```python
 from tickflow.async_runner import AsyncRunner
@@ -507,12 +545,13 @@ tokens arrive?" question) and makes snapshots a trivial JSON dict — there's
 no in-flight partial firing to save, so pause lands cleanly on tick
 boundaries.
 
-**Why three-layer RunState?** The old design had `History`, `audit` list, and
+**Why layered RunState?** The old design had `History`, `audit` list, and
 `Marking.node_state` as three separate, partially redundant structures. The
-three-layer `RunState` (`_edges` + `_state` + `_records`) unifies them under
-one owner with clear responsibilities. `_edges` and `_state` are always
-maintained (engine needs them); `_records` (detailed audit) is gated on
-`keep_records` and the absence of a persistent backend.
+layered `RunState` (`_edges` + `_fire_counts` + `_state` + `_records`)
+unifies them under one owner with clear responsibilities. `_edges` and
+`_state` are always maintained (engine needs them); `_fire_counts` maps the
+windowed entries back to `A[k]` ordinals; `_records` (detailed audit) is
+gated on `keep_records` and the absence of a persistent backend.
 
 **What's deliberately out of scope:** inclusive/XOR-join syntax beyond OR;
 distributed/multi-worker scheduling; a built-in timeline forest (use
@@ -534,7 +573,7 @@ tickflow/
   views.py        DictView, Resolved, Missing
   persistence.py  Backend protocol, JsonBackend, SqliteBackend, NullBackend
   cli.py          python -m tickflow ...
-tests/            17 files, 163 tests
+tests/            17 files, 186 tests
 examples/         8 examples (6 graph + 2 Python scripts)
 ```
 
