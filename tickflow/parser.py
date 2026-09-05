@@ -42,7 +42,10 @@ After parsing, :func:`parse` checks:
   declaration mentioning it),
 - at least one start node exists,
 - every guarded edge's guard name and every declared body name exist in the
-  given :class:`Registry` (pass ``registry=None`` to skip the lookup check).
+  given :class:`Registry` (pass ``registry=None`` to skip the lookup check),
+- bind declarations are validated for existence + reachability (same rule as
+  inputs), and every bound producer is auto-added to ``inputs`` with a latest
+  policy.
 
 Errors raise :class:`ParseError` with the line number and a message.
 """

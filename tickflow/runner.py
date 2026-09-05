@@ -121,6 +121,16 @@ def _validate_registry_for_graph(graph: Graph, registry: Registry) -> None:
 
 
 def _validate_bind_signatures(graph: Graph, registry: Registry) -> None:
+    """Strict-defaults contract (checked at Runner construction):
+
+    - E1 (positional) requires the body's positional arity to EQUAL the bind
+      entry count; E2 (named) requires the parameter-name set to EQUAL the
+      bind field set. ``arity=None`` (``*args`` bodies / non-introspectable
+      callables) skips E1, and unknown-arity guards skip E3.
+    - Defaulted parameters beyond the bound inputs are therefore REJECTED at
+      construction, even though the actual call would run fine — declare the
+      bind to match the full parameter list.
+    """
     for node in graph.nodes.values():
         if node.body is None:
             continue

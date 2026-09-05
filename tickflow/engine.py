@@ -25,6 +25,24 @@ state recording. It replaces the old scattered ``History``, ``audit`` list,
 and ``Marking.node_state``. Each tick, ``NodeState`` records are created
 and recorded into the ``RunState``.
 
+Dispatch
+--------
+Bodies and guards are called per their *registration-time signature*
+(see :func:`tickflow.registry.classify`):
+
+- **Value mode** (plain positional parameters): the engine passes the bound
+  input values positionally; a *named* bind (``{f: A}``) calls with keyword
+  arguments ``f=value`` instead; an optional keyword-only ``state`` tail
+  receives the mutable state proxy. Guards in value mode receive exactly one
+  positional argument: the adjudicated output.
+- **View mode** (a single ``v``/``view`` parameter): the callable receives a
+  :class:`~tickflow.views.NodeView` (bodies) or
+  :class:`~tickflow.views.GuardView` (guards).
+
+Identity bodies (no ``body:``) echo the *first bind value*. With an explicit
+reordered bind that is the first **bind** entry — which may differ from the
+first declared input.
+
 Bootstrap
 ---------
 ``bootstrap`` initialises the marking so every start node's input slots are
@@ -353,7 +371,13 @@ def _guard_node_view(
     """Build the adjudication view for a guard on ``src--|g|-->dst``: the
     firing node's current-tick output plus that node's bind-declared inputs,
     resolved with the same policies the body just consumed. Nothing else is
-    reachable — guards cannot read undeclared nodes."""
+    reachable — guards cannot read undeclared nodes.
+
+    Known limitation: for ``index`` policies the guard re-resolves at guard
+    time; if a same-tick peer's record lands between body-time and guard-time
+    (the sync engine records mid-phase) the pinned window can shift in exotic
+    eviction-edge cases — ``latest`` is immune.
+    """
     src_node = graph.nodes[src]
     entries = bind_entries(src_node)
     resolved: dict[str, Resolved] = {}

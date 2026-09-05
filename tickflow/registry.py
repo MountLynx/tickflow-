@@ -70,7 +70,19 @@ def classify(fn: Callable) -> Sig:
 
     Non-introspectable callables (some builtins) and ``*args``-accepting
     callables classify as value mode with ``arity=None`` — the engine calls
-    them with the bound values, and build-time arity validation skips them."""
+    them with the bound values, and build-time arity validation skips them.
+
+    Sharp edges:
+
+    - ``def f(v, *rest)`` classifies as **view mode** — a lone positional
+      ``v`` decides; the star parameter is ignored for classification.
+    - Annotations must be **bare names**: ``Optional[DictView]`` or
+      ``DictView | None`` do NOT trigger view mode (only an exact
+      ``NodeView``/``DictView`` annotation does).
+    - Value-mode validation (E1/E2 at Runner construction) requires EXACT
+      arity / param-name match — defaulted extra parameters are rejected at
+      construction even though the call itself would run.
+    """
     try:
         sig = inspect.signature(fn)
     except ValueError:  # some C builtins expose no signature

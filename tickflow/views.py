@@ -1,14 +1,51 @@
-"""Read-only views over history for body/guard callables.
+"""Read-only views handed to body/guard callables.
 
-A body or guard receives a :class:`DictView` that exposes, for the *current*
-node, each declared producer's output as resolved by that node's
-:class:`InputPolicy`. Access patterns::
+Two calling conventions exist. *Value mode* (preferred for hand-written
+bodies/guards): plain parameters, filled from the node's bind declaration by
+the engine — no view involved. *View mode*: the callable takes a single
+``v``/``view`` parameter and consumes one of the classes below.
 
-    view.A            # producer A's resolved value (latest_before or A[k])
-    view["A"]         # same, dict-style
-    view.A.value      # the resolved value
-    view.A.k          # the k used, or None if latest
-    view.inputs()     # dict[str, value] of all resolved inputs
+NodeView (view-mode bodies)
+---------------------------
+Per-fire context for a node. Consume bind-declared inputs; do not read by
+name::
+
+    v.input()   -> None | value | tuple  (arity-polymorphic)
+    v.args      -> tuple of bound values (always; ``Missing`` preserved)
+    v.named     -> {field: value} for named binds ({} for positional)
+    v.field(f)  -> named-bind lookup (TypeError on positional binds)
+    v.state     -> mutable state proxy (writes persist per firing)
+    v.node      -> this node's name
+
+GuardView (view-mode guards)
+----------------------------
+Adjudication context for the guard on edge ``src--|g|-->dst``. A guard rules
+on the output its source node just produced — it is not an input consumer, so
+there is deliberately NO ``input()``::
+
+    v.output    -> src's current-tick output (the thing being adjudicated)
+    v.args / v.named / v.field(f)
+                -> src's bind-declared inputs, resolved with the same
+                   policies (and values) the src body just consumed
+    v.state     -> src's post-body state, READ-ONLY
+    v.node / v.src -> the firing node's name
+
+The ``Missing`` three-state table
+---------------------------------
+``input()``/``args`` distinguish three situations that a bare ``None`` would
+collapse:
+
+- node has NO bound inputs at all  -> ``input()`` returns ``None``
+- input declared but producer has not fired yet -> ``Missing`` (falsy)
+- producer genuinely fired ``None`` -> ``None``
+
+Deprecated name-based access
+----------------------------
+Name-based access on a view (``view.A``, ``view["A"]``, ``view.inputs()``,
+``view.items()``, ``k in view``) still works but emits
+:class:`DeprecationWarning` and is scheduled for removal;
+:class:`DictView` survives only as a deprecated construction shim over
+:class:`NodeView`.
 
 Resolution semantics
 --------------------
@@ -18,20 +55,6 @@ Resolution semantics
   thus read the previous iteration's output, not their own.
 - ``index`` (``A[k]``): the producer's ``k``-th fire overall (1-based),
   independent of tick. Used for cross-iteration pinning and audit replays.
-
-A producer that has no qualifying fire yet yields a sentinel
-:class:`Missing`; bodies are expected to handle it (e.g. start nodes whose
-inputs haven't fired). The view does not raise so that a guard may simply
-return False on missing data.
-
-Bind-declared consumption
--------------------------
-The modern per-fire context is :class:`NodeView` (bodies) and
-:class:`GuardView` (guards): consume bind-declared inputs via
-``.input()``/``.args``/``.named``/``.field()`` instead of by-name access.
-Name-based access (``view.A``, ``view["A"]``, ``inputs()``, ...) is
-deprecated and emits :class:`DeprecationWarning`; :class:`DictView` survives
-only as a deprecated construction shim over :class:`NodeView`.
 """
 
 from __future__ import annotations

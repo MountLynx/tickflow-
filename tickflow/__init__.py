@@ -29,7 +29,8 @@ cheap JSON triple (marking + history + tick) and ``restore`` is a trivial
 rewind. See ``runner.Runner``.
 """
 
-from .ir import Graph, Node, Edge, InputPolicy, Failure
+from .ir import Graph, Node, Edge, InputPolicy, Failure, Bind
+from .views import NodeView, GuardView, DictView, Missing
 from .parser import parse, ParseError
 from .checker import (
     check,
@@ -52,6 +53,11 @@ __all__ = [
     "Edge",
     "InputPolicy",
     "Failure",
+    "Bind",
+    "NodeView",
+    "GuardView",
+    "DictView",
+    "Missing",
     "parse",
     "ParseError",
     "check",
