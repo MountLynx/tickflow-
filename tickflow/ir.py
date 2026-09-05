@@ -115,6 +115,11 @@ class Bind:
     @classmethod
     def named(cls, mapping) -> "Bind":
         """Named bind: field -> producer (dict or iterable of pairs)."""
+        if isinstance(mapping, str):
+            raise TypeError(
+                f"named() expects a mapping or pairs, got a bare string "
+                f"{mapping!r}"
+            )
         items = mapping.items() if hasattr(mapping, "items") else mapping
         return cls(entries=tuple((f, p) for f, p in items))
 

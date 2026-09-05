@@ -262,6 +262,9 @@ class GuardView(_BindAccess, _LegacyNameAccess):
     def state(self) -> Any:
         return self._state
 
+    def __repr__(self) -> str:
+        return f"GuardView(src={self._node!r}, inputs={list(self._resolved)})"
+
 
 class _ReadOnlyStateView:
     """Read-only state proxy handed to guards (they adjudicate; they don't write)."""

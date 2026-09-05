@@ -123,8 +123,10 @@ def _parse_bind_spec(spec: str, lineno: int) -> Bind:
     text = spec.strip()
     try:
         if text.startswith("{"):
-            if not text.endswith("}"):
+            if "}" not in text:
                 raise ValueError("unterminated named bind (missing '}')")
+            if not text.endswith("}"):
+                raise ValueError("named bind must be a single {...} block")
             entries: list[tuple[str, str]] = []
             for term in _split_terms(text[1:-1]):
                 m = re.fullmatch(rf"({_NAME})\s*:\s*({_NAME})", term)
@@ -137,8 +139,10 @@ def _parse_bind_spec(spec: str, lineno: int) -> Bind:
                 raise ValueError("empty named bind")
             return Bind.named(entries)
         if text.startswith("["):
-            if not text.endswith("]"):
+            if "]" not in text:
                 raise ValueError("unterminated positional bind (missing ']')")
+            if not text.endswith("]"):
+                raise ValueError("positional bind must be a single [...] block")
             terms = _split_terms(text[1:-1])
             if not terms:
                 raise ValueError("empty positional bind")
@@ -330,11 +334,15 @@ def _validate(g: Graph, reg: Registry, n_lines: int) -> None:
                         f"so the bound input will always be Missing",
                         n_lines,
                     )
-                log.warning(
-                    "node %r binds from %r which is not a producer "
-                    "(producers: %s) — resolution will use history, not token flow",
-                    name, prod, sorted(producers) or 'none',
-                )
+                # The inputs-validation loop above already warned about this
+                # upstream non-producer when it is declared in ``inputs``;
+                # only warn here if the bind is what surfaces it.
+                if prod not in node.inputs:
+                    log.warning(
+                        "node %r binds from %r which is not a producer "
+                        "(producers: %s) — resolution will use history, not token flow",
+                        name, prod, sorted(producers) or 'none',
+                    )
             node.inputs.setdefault(prod, InputPolicy.latest())
 
     # Warn on inputs from bodyless nodes (the resolved value will be None).

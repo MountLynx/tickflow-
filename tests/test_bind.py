@@ -27,6 +27,11 @@ def test_bind_named_accepts_pair_list():
     assert b.fields == ("x", "y")
 
 
+def test_bind_named_rejects_bare_string():
+    with pytest.raises(TypeError, match="bare string"):
+        Bind.named("xy")
+
+
 def test_bind_rejects_mixed():
     with pytest.raises(ValueError, match="mix"):
         Bind(entries=(("x", "A"), (None, "C")))

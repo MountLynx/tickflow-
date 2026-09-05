@@ -152,13 +152,16 @@ def _validate_bind_signatures(graph: Graph, registry: Registry) -> None:
                         f"inputs key order — declare {node.name}.bind: [...] "
                         f"to pin it against renames",
                         UserWarning,
-                        stacklevel=3,
+                        # Frame chain: warn-site -> _validate_bind_signatures
+                        # -> _validate_registry_for_graph -> _validate_registry
+                        # -> __init__ -> user's Runner(...) line.
+                        stacklevel=5,
                     )
     for edge in graph.edges:
         if edge.guard is None:
             continue
         gs = registry.guard_sig(edge.guard)
-        if gs.mode == "value" and gs.arity != 1:
+        if gs.mode == "value" and gs.arity is not None and gs.arity != 1:
             raise ValueError(
                 f"guard {edge.guard!r} (edge {edge.src}-->{edge.dst}) must take "
                 f"exactly 1 parameter (the adjudicated output); got {gs.arity}"

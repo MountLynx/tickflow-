@@ -85,3 +85,28 @@ def test_e1_skips_arity_unknown_var_args():
     r.body("var", lambda *a: len(a))
     g = parse("[A]-->C\n[B]-->C\nC.body: var", registry=r)
     Runner(g, r)  # no raise (a W1 auto-bind warning may fire; that's fine)
+
+
+def test_e3_skips_arity_unknown_var_args_guard():
+    r = Registry()
+    r.body("b1", lambda v: None)
+    r.guard("gvar", lambda *a: True)
+    g = parse("[A]-->B\nB--|gvar|-->C\nB.body: b1\nA.body: b1", registry=r)
+    Runner(g, r)  # arity unknown -> skip, like E1
+
+
+def test_e2_state_kwonly_param_excluded_from_match():
+    r = Registry()
+    r.body("with_state", lambda a, *, state: a)
+    g = parse("[A]-->C\nC.bind: {a: A}\nC.body: with_state", registry=r)
+    Runner(g, r)  # kwonly `state` is not part of param_names -> E2 passes
+
+
+def test_w1_fires_on_async_runner_too():
+    from tickflow.async_runner import AsyncRunner
+
+    r = Registry()
+    r.body("pos", lambda a, b: a + b)
+    g = parse("[A]-->C\n[B]-->C\nC.body: pos", registry=r)
+    with pytest.warns(UserWarning, match="auto-bind"):
+        AsyncRunner(g, r)

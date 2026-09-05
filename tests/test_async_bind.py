@@ -95,7 +95,8 @@ def test_async_guard_both_modes():
 
 
 def test_async_identity_body_bodyless_node():
-    # New-to-async in Task 7: bodyless nodes used to KeyError under AsyncRunner.
+    # New-to-async in Task 7: pre-Task-7 the legacy dispatch passed a view to
+    # bodies that did not accept one (TypeError on a 0-arity seed lambda).
     r = Registry()
     r.body("seed", lambda: "s")
     g = parse("[S]-->B\nS.body: seed", registry=r)  # B has no body -> identity
