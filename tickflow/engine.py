@@ -42,10 +42,13 @@ from typing import Any, Literal
 
 import logging
 
-from .ir import Graph, Failure
+from .ir import Graph, Failure, Node, InputPolicy
 from .registry import Registry
 from .state import NodeState, RunState, _jsonable
-from .views import DictView, Resolved, Missing
+# ``DictView`` is still the guard-evaluation view (_guard_view); Task 6 owns
+# moving guards to GuardView. ``GuardView``/``_ReadOnlyStateView`` are the
+# same migration's targets, imported here ahead of that change.
+from .views import Resolved, NodeView, GuardView, _ReadOnlyStateView, DictView
 
 log = logging.getLogger(__name__)
 
@@ -128,6 +131,84 @@ def _resolve_inputs(
     return out
 
 
+def bind_entries(node: Node) -> tuple[tuple[str | None, str], ...]:
+    """The node's bind declaration: explicit entries, or auto-bind derived
+    from the ``inputs`` key order (declaration order if the inputs were
+    declared explicitly, alphabetical via the parser's producer auto-fill
+    otherwise)."""
+    if node.bind is not None:
+        return node.bind.entries
+    return tuple((None, prod) for prod in node.inputs)
+
+
+def _prepare_fire(
+    graph: Graph, node: str, run_state: RunState, t: int, registry: Registry,
+) -> tuple[dict[str, Resolved], tuple[tuple[str | None, str], ...], tuple]:
+    """Shared Phase-A prep for the sync and async engines: resolve declared
+    inputs, derive bind entries, assemble the positional values tuple.
+
+    Missing fidelity: elements pass ``run_state.resolve`` results through
+    verbatim — a producer that has not fired yet contributes ``Missing``, and
+    only a genuinely-fired ``None`` output yields None (loop / spec-fallback
+    semantics downstream depend on this distinction)."""
+    nobj = graph.nodes[node]
+    resolved = _resolve_inputs(graph, node, run_state, t, registry)
+    entries = bind_entries(nobj)
+    values: list[Any] = []
+    for _f, prod in entries:
+        r = resolved.get(prod)
+        if r is None:
+            policy = nobj.inputs.get(prod) or InputPolicy.latest()
+            r = Resolved(
+                value=run_state.resolve(prod, policy.kind, policy.k, t), k=policy.k,
+            )
+            resolved[prod] = r
+        values.append(r.value)
+    values = tuple(values)
+    if len(values) != len(entries):  # pragma: no cover — entries drive the loop
+        raise RuntimeError(
+            f"node {node!r}: assembled {len(values)} values for "
+            f"{len(entries)} bind entries"
+        )
+    # Named field overlays for legacy by-name access (field wins over a
+    # colliding producer key).
+    for f, prod in entries:
+        if f is not None:
+            resolved[f] = resolved[prod]
+    return resolved, entries, values
+
+
+def prepare_body_call(
+    registry: Registry,
+    body_name: str,
+    entries: tuple[tuple[str | None, str], ...],
+    values: tuple,
+    state_view: Any,
+    resolved: dict[str, Resolved],
+    node: str,
+) -> tuple[Any, tuple, dict]:
+    """Resolve the call shape for a node body from its registered signature:
+    value mode (positional args / named kwargs / keyword-only ``state`` tail)
+    or view mode (one NodeView). Returns ``(fn, args, kwargs)``."""
+    body = registry.get_body(body_name)
+    sig = registry.body_sig(body_name)
+    is_named = any(f is not None for f, _ in entries)
+    if sig.mode == "value":
+        if is_named:
+            kwargs = {f: v for (f, _), v in zip(entries, values)}
+            if sig.wants_state:
+                kwargs["state"] = state_view
+            return body, (), kwargs
+        if sig.wants_state:
+            return body, values, {"state": state_view}
+        return body, values, {}
+    view = NodeView(
+        node=node, fields=entries, values=values,
+        state=state_view, resolved=resolved,
+    )
+    return body, (view,), {}
+
+
 def tick(
     graph: Graph,
     marking: Marking,
@@ -168,13 +249,19 @@ def tick(
     # before its write, so it too sees only prior ticks. This is the marking
     # step semantics.
     for node in fireable:
-        resolved = _resolve_inputs(graph, node, run_state, t, registry)
+        resolved, entries, values = _prepare_fire(graph, node, run_state, t, registry)
         # Initial mutable state: copy of the node's latest state from prior ticks.
         initial_state = run_state.mutable_state(node)
         state_view = _NodeStateView(initial_state)
-        view = DictView(resolved, state_view, node)
-        body = registry.get_body(graph.nodes[node].body)
-        output = body(view)
+        body_name = graph.nodes[node].body
+        if body_name is None:
+            # Identity: echo the first bound value (None with no inputs).
+            output = values[0] if values else None
+        else:
+            fn, args, kwargs = prepare_body_call(
+                registry, body_name, entries, values, state_view, resolved, node,
+            )
+            output = fn(*args, **kwargs)
         is_fail = isinstance(output, Failure)
         status: Literal["ok", "failed", "aborted"] = "ok"
         error: str | None = None

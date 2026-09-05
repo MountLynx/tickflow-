@@ -178,7 +178,9 @@ class Registry:
 
 
 def _identity_body(view: Any) -> Any:
-    """Default body: echo the first declared input's value, or None."""
+    """Default body: echo the first declared input's value, or None. The
+    engine inlines identity handling (first bind value); this callable is
+    kept for direct callers."""
     inputs = getattr(view, "_inputs", None)
     if not inputs:
         return None
