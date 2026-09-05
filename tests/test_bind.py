@@ -73,6 +73,11 @@ def test_bind_normalizes_list_entries():
     hash(b)  # normalized payload must be hashable
 
 
+def test_bind_rejects_bare_string_entry():
+    with pytest.raises(ValueError, match="pairs"):
+        Bind(entries=["AB"])
+
+
 def test_parser_bind_positional():
     g = parse("[A]-->C\n[B]-->C\nC.bind: [A, B]", registry=None)
     assert g.nodes["C"].bind.entries == ((None, "A"), (None, "B"))
@@ -113,7 +118,7 @@ def test_parser_bind_unreachable_producer():
         parse("[A]-->B\nC-->D\nB.bind: [C]", registry=None)
 
 
-def test_parser_bind_upstream_nonproducer_warns_and_adds_policy():
+def test_parser_bind_upstream_nonproducer_adds_policy():
     g = parse("[A]-->B\nB-->C\nC.bind: [A]", registry=None)
     assert g.nodes["C"].inputs["A"].kind == "latest"
 
@@ -122,3 +127,27 @@ def test_parser_bind_preserves_declared_policies():
     g = parse("[A]-->C\n[B]-->C\nC.inputs: A, B[2]\nC.bind: [B, A]", registry=None)
     assert g.nodes["C"].inputs["B"].kind == "index"
     assert g.nodes["C"].inputs["A"].kind == "latest"
+
+
+def test_parser_bind_error_has_line_number():
+    with pytest.raises(ParseError, match="line 2"):
+        parse("[A]-->C\nC.bind: [Z]", registry=None)
+
+
+def test_parser_bind_text_level_duplicates_rejected():
+    with pytest.raises(ParseError, match="[Dd]uplicate"):
+        parse("[A]-->C\n[B]-->C\nC.bind: [A, A]", registry=None)
+    with pytest.raises(ParseError, match="[Dd]uplicate"):
+        parse("[A]-->C\nC.bind: {x: A, x: A}", registry=None)
+
+
+def test_parser_bind_empty_containers_rejected():
+    with pytest.raises(ParseError):
+        parse("[A]-->C\nC.bind: {}", registry=None)
+    with pytest.raises(ParseError):
+        parse("[A]-->C\nC.bind: []", registry=None)
+
+
+def test_parser_bind_undeclared_node_no_path():
+    with pytest.raises(ParseError, match="no directed path"):
+        parse("[A]-->B\nZ.bind: [A]", registry=None)

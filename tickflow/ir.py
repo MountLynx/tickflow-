@@ -82,6 +82,12 @@ class Bind:
     entries: tuple[tuple[str | None, str], ...]
 
     def __post_init__(self) -> None:
+        for e in self.entries:
+            if isinstance(e, str):
+                raise ValueError(
+                    f"bind entries must be (field, producer) pairs, got a bare "
+                    f"string {e!r} — use Bind.positional([...]) or Bind.named({...})"
+                )
         object.__setattr__(
             self, "entries", tuple(tuple(e) for e in self.entries)
         )
