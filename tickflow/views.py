@@ -136,7 +136,10 @@ class _BindAccess:
 class _LegacyNameAccess:
     """Deprecated by-name input access shared by NodeView and GuardView.
     Key space: field names plus every resolved producer key (fields win when
-    both exist). Missing names raise AttributeError/KeyError without warning."""
+    both exist). Missing names raise AttributeError/KeyError without warning.
+    Reserved names (``args``/``named``/``field`` and the subclasses' own
+    properties) are not dispatched through here — producers with those names
+    remain reachable via ``view["name"]``."""
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
@@ -155,8 +158,10 @@ class _LegacyNameAccess:
         return _ResolvedAttr(r)
 
     def __contains__(self, name: str) -> bool:
-        _warn_name_access(self, f"{name!r} in view")
-        return name in self.__dict__.get("_resolved", {})
+        present = name in self.__dict__.get("_resolved", {})
+        if present:
+            _warn_name_access(self, f"{name!r} in view")
+        return present
 
     def inputs(self) -> dict[str, Any]:
         _warn_name_access(self, ".inputs()")
@@ -210,6 +215,9 @@ class NodeView(_BindAccess, _LegacyNameAccess):
         if len(v) == 1:
             return v[0]
         return v
+
+    def __repr__(self) -> str:
+        return f"NodeView(node={self._node!r}, inputs={list(self._resolved)})"
 
 
 class GuardView(_BindAccess, _LegacyNameAccess):
@@ -301,10 +309,11 @@ class DictView(NodeView):
             DeprecationWarning,
             stacklevel=2,
         )
-        resolved = dict(inputs) if inputs else {}
-        values = tuple(
-            r.value if isinstance(r, Resolved) else r for r in resolved.values()
-        )
+        resolved = {
+            k: (r if isinstance(r, Resolved) else Resolved(r, None))
+            for k, r in (inputs or {}).items()
+        }
+        values = tuple(r.value for r in resolved.values())
         super().__init__(node=node, fields=None, values=values, state=state,
                          resolved=resolved)
         # Compat alias: the pre-shim DictView stored inputs as ``_inputs`` and

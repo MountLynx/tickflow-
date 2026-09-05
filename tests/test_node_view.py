@@ -99,6 +99,23 @@ def test_dictview_shim_warns_and_behaves():
         assert v["A"].value == 5
 
 
+def test_dictview_shim_inputs_alias_pins_identity_relay():
+    from tickflow.registry import _identity_body
+
+    with pytest.warns(DeprecationWarning):
+        v = DictView({"A": Resolved(value=7, k=None)}, node="r")
+    assert v._inputs is v._resolved          # the alias _identity_body reads
+    assert _identity_body(v) == 7            # the engine's pre-Task-5 identity path
+
+
+def test_legacy_access_preserves_missing_and_none():
+    v = _node_view(resolved={"P": Resolved(Missing, None), "Z": Resolved(None, None)})
+    with pytest.warns(DeprecationWarning):
+        assert v.P.value is Missing
+    with pytest.warns(DeprecationWarning):
+        assert v.Z.value is None              # None-valued Resolved is not "absent"
+
+
 # --- GuardView ---
 
 def _guard_view(**kw):
