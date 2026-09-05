@@ -299,3 +299,14 @@ graph.nodes[key].bind = Bind.named(named) if named else None
 - 不做 `BodyResult` 状态返回（§4.4）。
 - 不让 guard 支持 index pin / 独立 bind（guard 裁决 body 的同一份数据，不另立解析）。
 - 不在 mermaid 渲染 bind。
+
+## 9. 实施后记（2026-09-05）
+
+Task 1–9 落地后的偏差与定案记录（与上文设计条款冲突时，以本节为准）：
+
+- **legacy/resolved 双键空间**：视图的 by-name 键与审计记录的键严格分离——字段名只叠加在视图的 legacy 键空间上（字段撞名时读取来自纯 resolved 表，绝不互相污染），审计 `NodeState.inputs` 只记真实生产者，审计纯净。
+- **E1/E2 对缺省参数严格（有意收紧，已文档化）**：位置模式要求 arity 精确相等、具名模式要求参数名集合精确相等；被绑输入之外的带默认值参数在 Runner 构造期即被拒绝（尽管实际调用本可运行）。`classify` 与 `_validate_bind_signatures` docstring 已注明。
+- **arity=None（`*args` / 不可自省调用方）跳过 E1/E3**：E1 与 E3 一致地跳过未知元数（一个 `*args` guard 确实接受 1 个参数），交由运行时调用。
+- **guard 侧 index 策略与 body 同源**：guard 按节点声明的同一 InputPolicy 重解析（`M[1]` 对齐案例已钉）；已知限制——sync 引擎同 tick 中段记录，index 策略在极端驱逐边缘下 guard 时刻的重解析窗口可能偏移（`latest` 免疫），已在 `_guard_node_view` docstring 如实记载，行为不改。
+- **GuardView 键空间 = {src → 当前输出} ∪ 声明输入**：src 名映射到被裁决的本轮输出（撞名时 src 优先），其余只能读 bind 声明内的字段/生产者，声明外一律 KeyError（P4）。
+- **兼容垫片 `DictView` 保留至 1.0**：构造 shim + by-name 访问的 DeprecationWarning 窗口，examples 的 `def f(v)` legacy 路径作为活体回归持续运行；1.0 前后按下游 SpecModule 迁移进度移除。

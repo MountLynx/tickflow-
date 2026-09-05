@@ -1374,6 +1374,46 @@ def test_guard_value_mode_receives_output_only():
     g = parse("[S]-->B\nB--|watch|-->C\nB.body: b1", registry=r)
     Runner(g, r).run_until_idle(max_ticks=3)
     assert seen == [5]
+
+
+def test_guard_sees_body_pinned_value_under_index_policy():
+    # Design §2.2: the guard adjudicates with the SAME data the body consumed.
+    # Under an index policy the guard must see the body's pinned fire, not
+    # latest (old all-nodes view forced latest for non-src producers).
+    # （实现者发现，Task 7 期间补：须加 X-->M 回边 + M.join: OR 让 M 点火两次，
+    #   原计划的无环图守卫只会被咨询一次，测不到 pin。）
+    r = Registry()
+    seen = []
+
+    def gen(v):
+        n = v.state.get("n", 0) + 1
+        v.state["n"] = n
+        return [n, n]  # list identity distinguishes fires by content
+
+    r.body("gen", gen)
+
+    def eat(m):
+        return {"ate": m}
+
+    r.body("eat", eat)
+
+    def watch(v):
+        seen.append(v.named["m"])
+        return len(seen) < 2
+
+    r.guard("watch", watch)
+    # X-->M back-edge + OR join loops M (so R fires twice; the plan's original
+    # acyclic graph could only ever consult the guard once). M fires [1,1] then
+    # [2,2]; both R fires pin M's FIRST fire via M[1].
+    g = parse(
+        "[S]-->M\nM-->R\nR--|watch|-->X\nX-->M\nM.join: OR\nR.inputs: M[1]\n"
+        "M.body: gen\nR.bind: {m: M}\nR.body: eat\nX.body: eat",
+        registry=r,
+    )
+    Runner(g, r).run_until_idle(max_ticks=6)
+    # Both consumer fires pinned M's FIRST fire ([1, 1]) — guard saw exactly
+    # what the body saw, not the evolving latest ([1, 1], [2, 2], ...).
+    assert seen == [[1, 1], [1, 1]]
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -1532,11 +1572,15 @@ def test_async_view_mode_and_missing():
     async def sink_body(x):
         return x
 
+    # stop-guard on the back edge: A must fire EXACTLY ONCE — on that first
+    # fire sink has not fired yet, so prev is Missing (the plan's unguarded
+    # cycle re-fired A and overwrote args with sink's real output).
     r.body("seed_body", lambda: "S")
     r.body("loop_body", loop_body)
     r.body("sink_body", sink_body)
+    r.guard("stop", lambda output: False)
     g = parse(
-        "[S]-->A\nA-->sink\nsink-->A\nA.join: OR\nS.body: seed_body\n"
+        "[S]-->A\nA-->sink\nsink--|stop|-->A\nA.join: OR\nS.body: seed_body\n"
         "A.bind: {prev: sink, seed: S}\nA.body: loop_body\nsink.body: sink_body",
         registry=r,
     )
@@ -1570,6 +1614,36 @@ def test_async_guard_both_modes():
     _run(rn.run_until_idle(max_ticks=5))
     assert value_seen == [5]
     assert view_seen == [5]
+
+
+def test_async_named_bind_missing_via_kwargs():
+    # Missing fidelity through the value-mode NAMED (kwargs) path, async side.
+    # （实现者发现，Task 8 期间补：须加 stop-guard 尾边 + A.join: OR，
+    #   否则无守卫回环会二次点火 A，覆盖 kwargs。）
+    r = Registry()
+    seen = {}
+
+    async def loop_body(a, b):
+        seen["pair"] = (a, b)
+        return "out"
+
+    async def sink_body(x):
+        return x
+
+    r.body("seed_body", lambda: "S")
+    r.body("loop_body", loop_body)
+    r.body("sink_body", sink_body)
+    r.guard("stop", lambda v: False)
+    g = parse(
+        "[S]-->A\nA-->sink\nsink--|stop|-->A\nA.join: OR\n"
+        "A.bind: {a: sink, b: S}\nS.body: seed_body\nA.body: loop_body\n"
+        "sink.body: sink_body",
+        registry=r,
+    )
+    rn = AsyncRunner(g, r)
+    _run(rn.run_until_idle(max_ticks=6))
+    # A's first fire: back-edge producer `sink` has not fired -> kwargs carry Missing.
+    assert seen["pair"] == (Missing, "S")
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
