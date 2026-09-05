@@ -1299,7 +1299,7 @@ def test_guard_output_is_current_tick_output():
 
     r.guard("watch", watch)
     g = parse(
-        "[S]-->B\nB--|watch|-->C\nC-->B\nB.join: OR\nC.body: echo", registry=r
+        "[S]-->B\nB--|watch|-->C\nC-->B\nB.join: OR\nB.body: bump\nC.body: echo", registry=r
     )
     Runner(g, r).run_until_idle(max_ticks=10)
     assert seen == [1, 2]  # adjudicated output, this tick — not latest_before
@@ -1324,6 +1324,8 @@ def test_guard_view_sees_src_declared_inputs():
             seen["legacy_prod"] = v["M"].value
         with pytest.raises(KeyError):
             v["NotDeclared"]  # P4: undeclared nodes are unreachable
+        with pytest.raises(KeyError):
+            v["S"]  # P4: real graph nodes outside the bind declaration too
         return False
 
     r.guard("watch", watch)
