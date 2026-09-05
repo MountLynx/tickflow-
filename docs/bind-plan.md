@@ -85,10 +85,10 @@ def test_bind_rejects_empty():
 
 
 def test_node_bind_default_none_copy_and_to_dict():
-    g = parse("[A]-->B\nB.bind: {x: A}", registry=None)
+    g = parse("[A]-->B", registry=None)
     assert g.nodes["A"].bind is None
-    assert g.nodes["B"].bind is not None
-    assert g.nodes["B"].bind.fields == ("x",)
+    assert g.nodes["B"].bind is None
+    g.nodes["B"].bind = Bind.named({"x": "A"})
     g2 = g.copy()
     assert g2.nodes["B"].bind == g.nodes["B"].bind
     d = g.to_dict()
@@ -96,6 +96,8 @@ def test_node_bind_default_none_copy_and_to_dict():
     assert d["nodes"]["A"]["bind"] is None
     json.dumps(d)  # must stay JSON-serialisable
 ```
+
+（注：此处用程序化赋值而非 `B.bind: {x: A}` 文本——DSL 语法属 Task 2，避免 Task 1 出现不可通过的测试。）
 
 - [ ] **Step 2: 跑测试确认失败**
 
