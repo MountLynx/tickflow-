@@ -54,12 +54,13 @@ import logging
 import os
 import tempfile
 import uuid
+import warnings
 import weakref
 from typing import Any, Callable, Iterable
 
 from .ir import Graph
 from .registry import Registry, registry as _default_registry
-from .engine import Marking, tick, bootstrap, _join_satisfied
+from .engine import Marking, tick, bootstrap, _join_satisfied, bind_entries
 from .state import NodeState, RunState, _jsonable
 from .persistence import NullBackend, SqliteBackend
 from .checker import check, DeadlockSuggestion, DeadlockError
@@ -102,7 +103,9 @@ def _cleanup_temp_db(backend: SqliteBackend, path: str) -> None:
 
 def _validate_registry_for_graph(graph: Graph, registry: Registry) -> None:
     """Raise ValueError if ``registry`` is missing any body or guard name
-    referenced by ``graph``."""
+    referenced by ``graph``, or if any signature contradicts the graph's bind
+    declarations (E1 arity / E2 named fields / E3 guard arity). Warn (W1) on
+    multi-producer auto-binds consumed by positional value-mode bodies."""
     missing: list[str] = []
     for node in graph.nodes.values():
         if node.body is not None and not registry.has_body(node.body):
@@ -114,6 +117,52 @@ def _validate_registry_for_graph(graph: Graph, registry: Registry) -> None:
         raise ValueError(
             "registry missing required entries:\n  " + "\n  ".join(missing)
         )
+    _validate_bind_signatures(graph, registry)
+
+
+def _validate_bind_signatures(graph: Graph, registry: Registry) -> None:
+    for node in graph.nodes.values():
+        if node.body is None:
+            continue
+        sig = registry.body_sig(node.body)
+        entries = bind_entries(node)
+        is_named = any(f is not None for f, _ in entries)
+        fields = tuple(f for f, _ in entries if f is not None)
+        if sig.mode == "value":
+            if is_named:
+                if set(sig.param_names) != set(fields):
+                    raise ValueError(
+                        f"node {node.name!r}: body {node.body!r} parameters "
+                        f"{list(sig.param_names)} do not match named bind fields "
+                        f"{list(fields)}"
+                    )
+            else:
+                # arity=None = unknown (*args bodies / non-introspectable
+                # callables) -> skip, the engine calls them with *values.
+                if sig.arity is not None and sig.arity != len(entries):
+                    raise ValueError(
+                        f"node {node.name!r}: body {node.body!r} expects "
+                        f"{sig.arity} parameter(s), bind declares "
+                        f"{len(entries)} input(s)"
+                    )
+                if node.bind is None and len(entries) >= 2:
+                    warnings.warn(
+                        f"node {node.name!r} relies on auto-bind for "
+                        f"{len(entries)} producers; positional order is the "
+                        f"inputs key order — declare {node.name}.bind: [...] "
+                        f"to pin it against renames",
+                        UserWarning,
+                        stacklevel=3,
+                    )
+    for edge in graph.edges:
+        if edge.guard is None:
+            continue
+        gs = registry.guard_sig(edge.guard)
+        if gs.mode == "value" and gs.arity != 1:
+            raise ValueError(
+                f"guard {edge.guard!r} (edge {edge.src}-->{edge.dst}) must take "
+                f"exactly 1 parameter (the adjudicated output); got {gs.arity}"
+            )
 
 
 def _warn_graph_changes(old: Graph, new: Graph, run_state: RunState) -> None:
@@ -195,6 +244,7 @@ class _BaseRunner:
     ) -> None:
         self.graph = graph
         self.registry = registry if registry is not None else _default_registry
+        self._validate_registry(self.registry)
         self.marking: Marking = bootstrap(graph)
         if backend is None:
             # D6: default = temp SqliteBackend, cleaned up with the Runner.

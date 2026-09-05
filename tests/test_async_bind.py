@@ -92,3 +92,41 @@ def test_async_guard_both_modes():
     _run(rn.run_until_idle(max_ticks=5))
     assert value_seen == [5]
     assert view_seen == [5]
+
+
+def test_async_identity_body_bodyless_node():
+    # New-to-async in Task 7: bodyless nodes used to KeyError under AsyncRunner.
+    r = Registry()
+    r.body("seed", lambda: "s")
+    g = parse("[S]-->B\nS.body: seed", registry=r)  # B has no body -> identity
+    rn = AsyncRunner(g, r)
+    _run(rn.run_until_idle(max_ticks=5))
+    assert rn.run_state.last_output("B") == "s"
+
+
+def test_async_named_bind_missing_via_kwargs():
+    # Missing fidelity through the value-mode NAMED (kwargs) path, async side.
+    r = Registry()
+    seen = {}
+
+    async def loop_body(a, b):
+        seen["pair"] = (a, b)
+        return "out"
+
+    async def sink_body(x):
+        return x
+
+    r.body("seed_body", lambda: "S")
+    r.body("loop_body", loop_body)
+    r.body("sink_body", sink_body)
+    r.guard("stop", lambda v: False)
+    g = parse(
+        "[S]-->A\nA-->sink\nsink--|stop|-->A\nA.join: OR\n"
+        "A.bind: {a: sink, b: S}\nS.body: seed_body\nA.body: loop_body\n"
+        "sink.body: sink_body",
+        registry=r,
+    )
+    rn = AsyncRunner(g, r)
+    _run(rn.run_until_idle(max_ticks=6))
+    # A's first fire: back-edge producer `sink` has not fired -> kwargs carry Missing.
+    assert seen["pair"] == (Missing, "S")
