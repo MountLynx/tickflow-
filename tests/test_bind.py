@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from tickflow import parse
+from tickflow import parse, ParseError
 from tickflow.ir import Bind
 
 
@@ -71,3 +71,54 @@ def test_bind_normalizes_list_entries():
     b = Bind(entries=[["x", "A"]])
     assert b.entries == (("x", "A"),)
     hash(b)  # normalized payload must be hashable
+
+
+def test_parser_bind_positional():
+    g = parse("[A]-->C\n[B]-->C\nC.bind: [A, B]", registry=None)
+    assert g.nodes["C"].bind.entries == ((None, "A"), (None, "B"))
+
+
+def test_parser_bind_named():
+    g = parse("[A]-->C\nC.bind: {x: A}", registry=None)
+    assert g.nodes["C"].bind.entries == (("x", "A"),)
+
+
+def test_parser_bind_single_sugar():
+    g = parse("[A]-->C\nC.bind: A", registry=None)
+    assert g.nodes["C"].bind.entries == ((None, "A"),)
+
+
+def test_parser_bind_bad_term():
+    with pytest.raises(ParseError):
+        parse("[A]-->C\nC.bind: [A, 2B]", registry=None)
+
+
+def test_parser_bind_unterminated():
+    with pytest.raises(ParseError):
+        parse("[A]-->C\nC.bind: [A", registry=None)
+
+
+def test_parser_bind_named_bad_term():
+    with pytest.raises(ParseError):
+        parse("[A]-->C\nC.bind: {x A}", registry=None)
+
+
+def test_parser_bind_unknown_producer():
+    with pytest.raises(ParseError, match="not a node"):
+        parse("[A]-->C\nC.bind: [Z]", registry=None)
+
+
+def test_parser_bind_unreachable_producer():
+    with pytest.raises(ParseError, match="no directed path"):
+        parse("[A]-->B\nC-->D\nB.bind: [C]", registry=None)
+
+
+def test_parser_bind_upstream_nonproducer_warns_and_adds_policy():
+    g = parse("[A]-->B\nB-->C\nC.bind: [A]", registry=None)
+    assert g.nodes["C"].inputs["A"].kind == "latest"
+
+
+def test_parser_bind_preserves_declared_policies():
+    g = parse("[A]-->C\n[B]-->C\nC.inputs: A, B[2]\nC.bind: [B, A]", registry=None)
+    assert g.nodes["C"].inputs["B"].kind == "index"
+    assert g.nodes["C"].inputs["A"].kind == "latest"

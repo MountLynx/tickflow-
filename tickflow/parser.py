@@ -21,6 +21,9 @@ Declaration lines (optional; defaults below)::
     C.inputs: A, B[2]   C reads A (latest_before) and B's 2nd fire (1-based)
     C.body: compute_c   C's body is the registered callable ``compute_c``
     C.join: OR          override join (AND default); usually set via checker
+    B.bind: [A, C]      positional bind: parameter 1 <- A, parameter 2 <- C
+    B.bind: {f: A}      named bind: field f <- producer A
+    B.bind: A           sugar for [A]
 
 Node names are ``[A-Za-z0-9_]+``. Guards are names too. Whitespace around
 tokens is ignored.
@@ -51,7 +54,7 @@ import re
 from dataclasses import dataclass
 from typing import Iterable
 
-from .ir import Graph, Node, Edge, InputPolicy
+from .ir import Graph, Node, Edge, InputPolicy, Bind
 from .registry import Registry, registry as _default_registry
 from .checker import check_unguarded_cycles
 
@@ -69,6 +72,7 @@ _EDGE_RE = re.compile(
 _INPUTS_RE = re.compile(rf"^(?P<node>{_NAME})\.inputs\s*:\s*(?P<spec>.+)$")
 _BODY_RE = re.compile(rf"^(?P<node>{_NAME})\.body\s*:\s*(?P<body>{_NAME})$")
 _JOIN_RE = re.compile(rf"^(?P<node>{_NAME})\.join\s*:\s*(?P<join>AND|OR)$")
+_BIND_RE = re.compile(rf"^(?P<node>{_NAME})\.bind\s*:\s*(?P<spec>.+)$")
 # Bare start declaration: "[A]" alone on a line.
 _BARE_START_RE = re.compile(rf"^\[(?P<node>{_NAME})\]\s*$")
 # A single input term: "A" or "A[2]"
@@ -110,6 +114,45 @@ def _parse_inputs_spec(spec: str, lineno: int) -> dict[str, InputPolicy]:
     return out
 
 
+def _split_terms(s: str) -> list[str]:
+    return [t.strip() for t in s.split(",") if t.strip()]
+
+
+def _parse_bind_spec(spec: str, lineno: int) -> Bind:
+    """Parse ``[A, C]`` / ``{field: A}`` / single-name sugar into a Bind."""
+    text = spec.strip()
+    try:
+        if text.startswith("{"):
+            if not text.endswith("}"):
+                raise ValueError("unterminated named bind (missing '}')")
+            entries: list[tuple[str, str]] = []
+            for term in _split_terms(text[1:-1]):
+                m = re.fullmatch(rf"({_NAME})\s*:\s*({_NAME})", term)
+                if not m:
+                    raise ValueError(
+                        f"bad named bind term {term!r} (expected 'field: producer')"
+                    )
+                entries.append((m.group(1), m.group(2)))
+            if not entries:
+                raise ValueError("empty named bind")
+            return Bind.named(entries)
+        if text.startswith("["):
+            if not text.endswith("]"):
+                raise ValueError("unterminated positional bind (missing ']')")
+            terms = _split_terms(text[1:-1])
+            if not terms:
+                raise ValueError("empty positional bind")
+            for term in terms:
+                if not re.fullmatch(_NAME, term):
+                    raise ValueError(f"bad positional bind term {term!r}")
+            return Bind.positional(terms)
+        if re.fullmatch(_NAME, text):
+            return Bind.positional([text])
+        raise ValueError("expected [A, C] or {field: A} or a single producer name")
+    except ValueError as e:
+        raise ParseError(str(e), lineno) from e
+
+
 def parse(text: str, registry: Registry | None = None) -> Graph:
     """Parse graph text into a :class:`Graph`.
 
@@ -141,6 +184,11 @@ def parse(text: str, registry: Registry | None = None) -> Graph:
             _ensure_node(g, node)
             g.nodes[node].inputs = _parse_inputs_spec(m.group("spec"), lineno)
             explicit_inputs.add(node)
+            continue
+        if (m := _BIND_RE.match(line)):
+            node = m.group("node")
+            _ensure_node(g, node)
+            g.nodes[node].bind = _parse_bind_spec(m.group("spec"), lineno)
             continue
         if (m := _BODY_RE.match(line)):
             node = m.group("node")
@@ -259,6 +307,35 @@ def _validate(g: Graph, reg: Registry, n_lines: int) -> None:
                     "(producers: %s) — resolution will use history, not token flow",
                     name, src, sorted(producers) or 'none',
                 )
+
+    # Validate binds (existence + reachability, same rule as inputs) and make
+    # every bound producer resolvable: default policy is latest_before.
+    for name, node in g.nodes.items():
+        if node.bind is None:
+            continue
+        producers = set(g.producers(name))
+        for _field, prod in node.bind.entries:
+            if prod not in g.nodes:
+                raise ParseError(
+                    f"node {name!r} binds from {prod!r} which is not "
+                    f"a node in the graph",
+                    n_lines,
+                )
+            if prod not in producers:
+                if prod not in upstream.get(name, set()):
+                    raise ParseError(
+                        f"node {name!r} binds from {prod!r} which is not a producer "
+                        f"and has no directed path to {name!r} — "
+                        f"{prod!r} fires after or independently of {name!r}, "
+                        f"so the bound input will always be Missing",
+                        n_lines,
+                    )
+                log.warning(
+                    "node %r binds from %r which is not a producer "
+                    "(producers: %s) — resolution will use history, not token flow",
+                    name, prod, sorted(producers) or 'none',
+                )
+            node.inputs.setdefault(prod, InputPolicy.latest())
 
     # Warn on inputs from bodyless nodes (the resolved value will be None).
     for name, node in g.nodes.items():
