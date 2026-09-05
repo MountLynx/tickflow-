@@ -82,6 +82,9 @@ class Bind:
     entries: tuple[tuple[str | None, str], ...]
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "entries", tuple(tuple(e) for e in self.entries)
+        )
         if not self.entries:
             raise ValueError("bind must declare at least one producer")
         fields = [f for f, _ in self.entries if f is not None]
@@ -96,6 +99,11 @@ class Bind:
     @classmethod
     def positional(cls, producers) -> "Bind":
         """Anonymous positional bind: parameter i <- producers[i]."""
+        if isinstance(producers, str):
+            raise TypeError(
+                f"positional() expects an iterable of producer names, got a bare "
+                f"string {producers!r} — wrap it in a list: [{producers!r}]"
+            )
         return cls(entries=tuple((None, p) for p in producers))
 
     @classmethod

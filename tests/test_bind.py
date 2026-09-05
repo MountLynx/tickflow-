@@ -58,3 +58,16 @@ def test_node_bind_default_none_copy_and_to_dict():
     assert d["nodes"]["B"]["bind"] == {"fields": ["x"], "producers": ["A"]}
     assert d["nodes"]["A"]["bind"] is None
     json.dumps(d)  # must stay JSON-serialisable
+
+
+# --- parser syntax (Task 2) ---
+
+def test_bind_positional_rejects_bare_string():
+    with pytest.raises(TypeError, match="bare"):
+        Bind.positional("AB")
+
+
+def test_bind_normalizes_list_entries():
+    b = Bind(entries=[["x", "A"]])
+    assert b.entries == (("x", "A"),)
+    hash(b)  # normalized payload must be hashable
