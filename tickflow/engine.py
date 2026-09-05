@@ -45,10 +45,9 @@ import logging
 from .ir import Graph, Failure, Node, InputPolicy
 from .registry import Registry
 from .state import NodeState, RunState, _jsonable
-# Guard adjudication uses GuardView + _ReadOnlyStateView; DictView survives
-# only inside _guard_view, the legacy all-nodes view the (unmigrated) async
-# engine still imports (Task 7 deletes it).
-from .views import Resolved, NodeView, GuardView, _ReadOnlyStateView, DictView
+# Guard adjudication uses GuardView + _ReadOnlyStateView; view-mode bodies get
+# NodeView (value-mode bodies get plain positional/named values).
+from .views import Resolved, NodeView, GuardView, _ReadOnlyStateView
 
 log = logging.getLogger(__name__)
 
@@ -395,38 +394,6 @@ def prepare_guard_call(
     if sig.mode == "value":
         return guard, (src_output,), {}
     return guard, (_guard_node_view(graph, src, src_output, run_state, t),), {}
-
-
-def _guard_view(
-    graph: Graph,
-    src: str,
-    src_output: Any,
-    run_state: RunState,
-    t: int,
-    registry: Registry,
-) -> DictView:
-    """Build a view for guard evaluation where the firing node ``src``'s
-    *current-tick* output is visible under its own name, and any other
-    producer the guard may reference resolves to latest_before(t).
-
-    Legacy all-nodes view; only the (unmigrated) async engine still uses it.
-    Removed in the next task.
-
-    The firing node's own mutable state (just recorded in run_state) is
-    exposed via ``view.state`` so a guard like "retry under max" can read
-    ``view.state["attempts"]``.
-    """
-    resolved: dict[str, Resolved] = {}
-    # The firing node itself, with its just-produced output.
-    resolved[src] = Resolved(value=src_output, k=None)
-    for name in graph.nodes:
-        if name == src:
-            continue
-        v = run_state.resolve(name, "latest", None, t)
-        resolved[name] = Resolved(value=v, k=None)
-    src_state = run_state.mutable_state(src)
-    state_view = _NodeStateView(src_state)
-    return DictView(resolved, state_view, src)
 
 
 class _NodeStateView:

@@ -37,10 +37,10 @@ from typing import Any, Awaitable, Callable, Iterable
 from .ir import Graph, Failure
 from .registry import Registry, registry as _default_registry
 from .engine import (
-    Marking, bootstrap, _join_satisfied, _resolve_inputs, _guard_view, _NodeStateView,
+    Marking, bootstrap, _join_satisfied, _prepare_fire,
+    prepare_body_call, prepare_guard_call, _NodeStateView,
 )
 from .state import NodeState, RunState, _jsonable
-from .views import DictView
 from .runner import (
     _BaseRunner, RunStatus, _TERMINAL, FireHook, TickEndHook,
     _validate_registry_for_graph, _warn_graph_changes,
@@ -87,12 +87,17 @@ async def async_tick(
     m_next = marking.copy()
 
     async def _fire(node: str) -> NodeState:
-        resolved = _resolve_inputs(graph, node, run_state, t, registry)
+        legacy, resolved, entries, values = _prepare_fire(graph, node, run_state, t, registry)
         initial_state = run_state.mutable_state(node)
         state_view = _NodeStateView(initial_state)
-        view = DictView(resolved, state_view, node)
-        body = registry.get_body(graph.nodes[node].body)
-        output = await _maybe_await(body, view)
+        body_name = graph.nodes[node].body
+        if body_name is None:
+            output = values[0] if values else None
+        else:
+            fn, args, kwargs = prepare_body_call(
+                registry, body_name, entries, values, state_view, legacy, node,
+            )
+            output = await _maybe_await(fn, *args, **kwargs)
         is_fail = isinstance(output, Failure)
         status: Literal["ok", "failed", "aborted"] = "ok"
         error: str | None = None
@@ -126,10 +131,10 @@ async def async_tick(
             elif e.guard is None:
                 v = True
             else:
-                gview = _guard_view(
-                    graph, e.src, f.output, run_state, t, registry,
+                gfn, gargs, gkwargs = prepare_guard_call(
+                    registry, e.guard, graph, e.src, f.output, run_state, t,
                 )
-                v = bool(await _maybe_await(registry.get_guard(e.guard), gview))
+                v = bool(await _maybe_await(gfn, *gargs, **gkwargs))
             m_next.slots[(e.dst, e.src)] = v
             f.edges_fired.append((e.dst, e.guard, v))
 
