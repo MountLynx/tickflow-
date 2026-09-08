@@ -10,11 +10,11 @@ def main():
     r = Registry()
 
     @r.body("accumulator")
-    def _acc(v):
-        total = v.state.get("total", 0)
+    def _acc(start, A, *, state):
+        total = state.get("total", 0)
         # Self-loop: A fires every tick, always increments by 1.
         total += 1
-        v.state["total"] = total
+        state["total"] = total
         return total
 
     g = Graph()

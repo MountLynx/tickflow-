@@ -14,21 +14,18 @@ def main():
     r = Registry()
 
     @r.body("seed_zero")
-    def _seed(v):
+    def _seed():
         return 0
 
     @r.body("passthru")
-    def _p(v):
-        for _n, val in v.items():
-            if val is not Missing:
-                return val
-        return None
+    def _p(B, seed):
+        return B if B is not Missing else seed
 
     @r.body("incr")
-    def _incr(v):
-        return v.A.value + 1
+    def _incr(A):
+        return A + 1
 
-    r.guard("cont_lt5", lambda v: v.B.value < 5)
+    r.guard("cont_lt5", lambda out: out < 5)
 
     graph_text = """
 [seed]-->A
@@ -64,10 +61,10 @@ B--|cont_lt5|-->A
 
         # 4. Remap: change guard from cont_lt5 to cont_lt3 (shorter loop).
         new_r = Registry()
-        new_r.body("seed_zero", lambda v: 0)
+        new_r.body("seed_zero", lambda: 0)
         new_r.body("passthru", _p)
         new_r.body("incr", _incr)
-        new_r.guard("cont_lt3", lambda v: v.B.value < 3)
+        new_r.guard("cont_lt3", lambda out: out < 3)
 
         new_g = parse(graph_text.replace("cont_lt5", "cont_lt3"), registry=new_r)
         rn.remap_graph(new_g, registry=new_r)

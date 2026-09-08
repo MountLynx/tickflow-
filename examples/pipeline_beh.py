@@ -1,23 +1,23 @@
-"""Behaviours for pipeline.txt — three-stage pipe with A[k] index policy."""
+"""Behaviours for pipeline.txt — three-stage pipe with A[k] index policy.
+
+C reads A[1] (A's first fire) regardless of B's current output; B is C's
+producer (token flow) but is not declared as a read input, so value-mode C
+only receives A[1].
+"""
 from tickflow import registry
-from tickflow.views import Missing
 
 
 @registry.body("seed_value")
-def _seed(v):
+def _seed():
     return 7
 
 
 @registry.body("transform")
-def _transform(v):
-    a_val = v.A.value if "A" in v else 0
-    return a_val * 10 + 5
-
+def _transform(A):
+    return A * 10 + 5
 
 
 @registry.body("reference_first")
-def _ref(v):
+def _ref(A):
     # C reads A[1] (A's first fire) regardless of B's current output.
-    a_first = v.A.value if "A" in v else Missing
-    b_val = v.B.value if "B" in v else Missing
-    return {"a_first": a_first, "b_current": b_val}
+    return {"a_first": A}

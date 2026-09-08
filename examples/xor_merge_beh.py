@@ -5,25 +5,21 @@ from tickflow.views import Missing
 
 
 @registry.body("decide")
-def _decide(v):
+def _decide(start):
     # In a real graph this would inspect inputs; here it always routes to A.
     return "go_a"
 
 
 @registry.body("merge")
-def _merge(v):
-    a = v.A.value if "A" in v else Missing
-    d = v.D.value if "D" in v else Missing
-    if a is not Missing:
-        return ("A", a)
-    return ("D", d)
+def _merge(A, D):
+    return ("A", A) if A is not Missing else ("D", D)
 
 
 @registry.guard("go_a")
-def _go_a(v):
+def _go_a(out):
     return True
 
 
 @registry.guard("go_d")
-def _go_d(v):
+def _go_d(out):
     return False
