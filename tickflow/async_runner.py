@@ -221,7 +221,11 @@ class AsyncRunner(_BaseRunner):
         if aborted:
             self.status = RunStatus.ABORTED
         elif not firings:
-            self.status = RunStatus.IDLE
+            # Mirror of Runner.tick: empty-tick fixpoint — pending work with
+            # nothing fireable is the starved FAILED terminal.
+            self.status = (
+                RunStatus.FAILED if self._has_pending() else RunStatus.IDLE
+            )
         else:
             self.status = RunStatus.RUNNING
         await self._run_tick_end_hooks(self.tick_count - 1, firings)

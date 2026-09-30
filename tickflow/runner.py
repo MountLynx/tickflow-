@@ -634,7 +634,11 @@ class Runner(_BaseRunner):
         if aborted:
             self.status = RunStatus.ABORTED
         elif not firings:
-            self.status = RunStatus.IDLE
+            # Empty tick is a fixpoint (sync barrier semantics): pending work
+            # with nothing fireable can never fire -> starved terminal.
+            self.status = (
+                RunStatus.FAILED if self._has_pending() else RunStatus.IDLE
+            )
         else:
             self.status = RunStatus.RUNNING
         self._run_tick_end_hooks(self.tick_count - 1, firings)
