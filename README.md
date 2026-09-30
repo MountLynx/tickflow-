@@ -303,7 +303,8 @@ def call_llm(v):
 
 - **`type="llm"`** (default): a logical/recoverable failure. The node's
   out-edges write `False`, so downstream AND-joins don't fire (= "upstream
-  failed, skip downstream"). The run continues.
+  failed, skip downstream"). The run keeps ticking — unless the skip
+  strands pending work, in which case it ends `FAILED` (see below).
 - **`type="infrastructure"`**: an unrecoverable failure. Out-edges write
   `False` **and** the runner enters `ABORTED`, halting all further ticks.
 
@@ -575,7 +576,7 @@ tickflow/
   views.py        DictView, Resolved, Missing
   persistence.py  Backend protocol, JsonBackend, SqliteBackend, NullBackend
   cli.py          python -m tickflow ...
-tests/            17 files, 186 tests
+tests/            25 files, 291 tests
 examples/         8 examples (6 graph + 2 Python scripts)
 ```
 

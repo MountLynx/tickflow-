@@ -277,7 +277,8 @@ def call_llm(v):
 ```
 
 - **`type="llm"`**（默认）：逻辑性/可恢复失败。节点出边写 `False`，下游
-  AND-join 因此不激发（="上游失败，跳过下游"）。运行继续。
+  AND-join 因此不激发（="上游失败，跳过下游"）。运行继续推进——除非跳过
+  导致待做工作搁浅，此时以 `FAILED`（饿死）结束（见下）。
 - **`type="infrastructure"`**：不可恢复失败。出边写 `False` **且** runner
   进入 `ABORTED`，停止后续所有 tick。
 
@@ -531,7 +532,7 @@ tickflow/
   views.py        DictView, Resolved, Missing
   persistence.py  Backend 协议, JsonBackend, SqliteBackend, NullBackend
   cli.py          python -m tickflow ...
-tests/            17 个文件，186 个测试
+tests/            25 个文件，291 个测试
 examples/         8 个示例（6 图 + 2 Python 脚本）
 ```
 
