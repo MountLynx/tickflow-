@@ -286,7 +286,8 @@ def call_llm(v):
 
 > **注意**：失败节点向**所有**出边写 `False`——守卫不再求值。要实现
 > 可控路由（例如失败重试），让 body 返回结果 dict、由守卫检查输出值，
-> 而不是返回 `Failure`。
+> 而不是返回 `Failure`。若跳过导致待做工作搁浅（AND-join 的另一输入已
+> 到场），run 以 `FAILED`（饿死）结束而非 `IDLE`。
 
 ### RunStatus
 
@@ -294,11 +295,11 @@ def call_llm(v):
 
 | 状态 | 含义 |
 |--------|---------|
-| `IDLE` | 静默（上个 tick 无激发，或尚未开始） |
+| `IDLE` | 静默且无待做工作（全部完成，或尚未开始） |
 | `RUNNING` | 某 tick 有激发（瞬态；下一步变为 IDLE 或终止态） |
 | `ABORTED` | 发生了 infrastructure `Failure`；已停止 |
 | `CANCELLED` | 调用了 `cancel()`；已停止 |
-| `FAILED` | （保留）所有节点失败且无可激发节点 |
+| `FAILED` | 饿死：有待做工作（True 槽位/未触发的 start）但无可激发节点；已停止 |
 
 ```python
 rn.cancel("user requested")        # -> CANCELLED；tick 变为空操作

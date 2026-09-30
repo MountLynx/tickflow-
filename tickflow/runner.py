@@ -10,12 +10,13 @@ fires whole ticks.
 RunStatus
 ---------
 Replaces the old ``_idle: bool``. A run transitions:
-    IDLE --tick--> RUNNING --(no fireable / max_ticks)--> IDLE
+    IDLE --tick--> RUNNING --(empty tick, nothing pending)--> IDLE
                 --(infra Failure)--> ABORTED
                 --cancel()--> CANCELLED
-                --(all failed, no fireable)--> FAILED
+                --(starved: work pending, nothing fireable)--> FAILED
 ``is_idle()`` is ``status == IDLE``. ABORTED/CANCELLED/FAILED ticks return
-empty and do not advance.
+empty and do not advance. (max_ticks exhaustion leaves RUNNING -- the caller
+decides whether to resume; run_until_idle just stops.)
 
 Hooks
 -----
@@ -230,15 +231,16 @@ def _warn_graph_changes(old: Graph, new: Graph, run_state: RunState) -> None:
 
 
 class RunStatus(str, enum.Enum):
-    """Lifecycle of a Runner. IDLE means "quiescent, may have work pending but
-    nothing fired last tick" -- historically the only state. The terminal
-    states (ABORTED/CANCELLED/FAILED) stop further ticking."""
+    """Lifecycle of a Runner. IDLE means "quiescent with nothing pending" --
+    an empty tick that still has pending work (armed starts or a True slot)
+    is FAILED instead. The terminal states (ABORTED/CANCELLED/FAILED) stop
+    further ticking."""
 
-    IDLE = "idle"           # quiescent (nothing fired, or never started)
+    IDLE = "idle"           # quiescent, nothing pending (done, or never started)
     RUNNING = "running"     # a tick is in progress (transient, not persisted)
     ABORTED = "aborted"     # an infrastructure Failure occurred; halted
     CANCELLED = "cancelled"  # cancel() was called
-    FAILED = "failed"       # all nodes failed and nothing is fireable
+    FAILED = "failed"       # starved: work pending but nothing fireable
 
 
 # Hook type aliases.

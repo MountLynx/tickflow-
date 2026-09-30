@@ -504,3 +504,23 @@ def _incr_fetch(data):
 - [注册表与行为](19-registry-and-behaviours) — body/guard 注册契约
 - [解析器与图 IR](8-parser-and-graph-ir) — 图验证与 InputPolicy
 - [Tick 执行语义](5-tick-execution-semantics) — 引擎 tick 循环
+
+---
+
+## FAILED 终态落地：饿死 run 不再误报 done（0.3.0，2026-09-30）
+
+状态机文档自始承诺四个终态，但 `FAILED` 从未被赋值：AND-join 饿死（等一个
+永不来的 True 槽位）→ 空 tick → status 停在 IDLE → 嵌入层（SpecModule
+`_finalize_phase`）把 IDLE 映射成 done——"图里有工作永远点不着火"的 run 被
+报成成功。
+
+修复：`runner.py` / `async_runner.py` 两处 tick 状态判定，空 tick 时按
+`_has_pending()`（armed_starts 非空或任意槽位 True）区分——有 pending →
+FAILED（新终态，ticking 停止），无 pending → IDLE（不变）。同步屏障语义下
+空 tick 即不动点，无误报面：producer 写槽与 consumer 点火逐 tick 交替，
+mid-flight 不产生空 tick；pause 在 tick 前 break；cancel 是独立终态；
+max_ticks 耗尽停在 RUNNING（truncated，可 resume）。
+
+嵌入侧：SpecModule `_finalize_phase` 的 FAILED 分支文案改为
+"starved: work pending but nothing fireable"，并附未点火节点清单
+（任务全集 − 已点火，模块层由 run_state 边历史推导，不新增引擎 API）。

@@ -313,7 +313,9 @@ A `Failure` is still recorded in `RunState` and the audit log with
 > **Important**: a failed node writes `False` to **all** out-edges —
 > guarded edges are not evaluated. To implement controllable routing
 > (e.g. retry on failure), have the body return a result dict and let the
-> guard inspect the output value, rather than returning `Failure`.
+> guard inspect the output value, rather than returning `Failure`. If the
+> skip strands pending work (an AND-join whose other input already
+> arrived), the run ends `FAILED` (starved) instead of `IDLE`.
 
 ### RunStatus
 
@@ -321,11 +323,11 @@ A `Failure` is still recorded in `RunState` and the audit log with
 
 | Status | Meaning |
 |--------|---------|
-| `IDLE` | quiescent (nothing fired last tick, or never started) |
+| `IDLE` | quiescent with nothing pending (all work done, or never started) |
 | `RUNNING` | a tick fired (transient; becomes IDLE/terminal next) |
 | `ABORTED` | an infrastructure `Failure` occurred; halted |
 | `CANCELLED` | `cancel()` was called; halted |
-| `FAILED` | (reserved) all nodes failed and nothing fireable |
+| `FAILED` | starved: work is pending (a True slot / armed start) but nothing is fireable; halted |
 
 ```python
 rn.cancel("user requested")        # -> CANCELLED; ticks become no-ops
